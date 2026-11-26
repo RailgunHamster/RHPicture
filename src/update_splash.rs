@@ -158,7 +158,12 @@ fn foreground_monitor_work_area() -> Option<RECT> {
 }
 
 /// Launch the independent update transition splash outside the Velopack installation directory.
-pub fn launch(from_version: &str, to_version: &str, root_dir: &Path) -> Option<Transition> {
+pub fn launch(
+    from_version: &str,
+    to_version: &str,
+    root_dir: &Path,
+    dark_theme: bool,
+) -> Option<Transition> {
     if cfg!(test) {
         return None;
     }
@@ -174,6 +179,8 @@ pub fn launch(from_version: &str, to_version: &str, root_dir: &Path) -> Option<T
             from_version,
             "--to-version",
             to_version,
+            "--theme",
+            if dark_theme { "dark" } else { "light" },
             "--wait-pid",
             &std::process::id().to_string(),
         ])
@@ -227,6 +234,7 @@ pub struct SplashArgs {
     pub demo_ms: u64,
     pub demo_stage: usize,
     pub snapshot_path: Option<PathBuf>,
+    pub dark_theme: bool,
 }
 
 impl SplashArgs {
@@ -246,6 +254,7 @@ impl SplashArgs {
             demo_ms: 0,
             demo_stage: 2,
             snapshot_path: None,
+            dark_theme: false,
         };
         let mut i = 1;
         while i < args.len() {
@@ -303,6 +312,10 @@ impl SplashArgs {
                     if !next.is_empty() {
                         out.snapshot_path = Some(PathBuf::from(next));
                     }
+                    i += 2;
+                }
+                "--theme" => {
+                    out.dark_theme = next.eq_ignore_ascii_case("dark");
                     i += 2;
                 }
                 _ => i += 1,
@@ -374,9 +387,9 @@ pub fn run_splash_process(args: SplashArgs) {
         return;
     };
 
-    // Enable Windows 11 native DWM rounded corners & dark mode border
+    // Enable Windows 11 native DWM rounded corners & light/dark border
     unsafe {
-        let dark: i32 = 1;
+        let dark: i32 = if args.dark_theme { 1 } else { 0 };
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -650,17 +663,27 @@ impl SplashState {
         let dpi = self.dpi;
         let s = |v: i32| scale_dpi(v, dpi);
         let sf = dpi as f32 / 96.0;
+        let dark = self.args.dark_theme;
 
         if let Some(mut pm) = Pixmap::new(w as u32, h as u32) {
-            // 1. Sleek obsidian-slate backdrop with subtle top-left radial/linear sheen
-            if let Some(grad) = LinearGradient::new(
-                Point::from_xy(0.0, 0.0),
-                Point::from_xy(w as f32, h as f32),
+            // 1. Modern pearl-light or obsidian-slate backdrop
+            let bg_stops = if dark {
                 vec![
                     GradientStop::new(0.0, Color::from_rgba8(15, 23, 42, 255)),
                     GradientStop::new(0.55, Color::from_rgba8(17, 24, 39, 255)),
                     GradientStop::new(1.0, Color::from_rgba8(11, 17, 32, 255)),
-                ],
+                ]
+            } else {
+                vec![
+                    GradientStop::new(0.0, Color::from_rgba8(255, 255, 255, 255)),
+                    GradientStop::new(0.6, Color::from_rgba8(248, 250, 252, 255)),
+                    GradientStop::new(1.0, Color::from_rgba8(241, 245, 249, 255)),
+                ]
+            };
+            if let Some(grad) = LinearGradient::new(
+                Point::from_xy(0.0, 0.0),
+                Point::from_xy(w as f32, h as f32),
+                bg_stops,
                 SpreadMode::Pad,
                 Transform::identity(),
             ) {
@@ -674,15 +697,15 @@ impl SplashState {
                 );
             }
 
-            // Subtle ambient top accent glow bar
+            // Ambient top accent glow bar
             if let Some(glow) = LinearGradient::new(
                 Point::from_xy(0.0, 0.0),
                 Point::from_xy(w as f32, 0.0),
                 vec![
                     GradientStop::new(0.0, Color::from_rgba8(14, 165, 233, 0)),
-                    GradientStop::new(0.35, Color::from_rgba8(56, 189, 248, 170)),
-                    GradientStop::new(0.65, Color::from_rgba8(52, 211, 153, 170)),
-                    GradientStop::new(1.0, Color::from_rgba8(52, 211, 153, 0)),
+                    GradientStop::new(0.35, Color::from_rgba8(14, 165, 233, if dark { 170 } else { 220 })),
+                    GradientStop::new(0.65, Color::from_rgba8(16, 185, 129, if dark { 170 } else { 220 })),
+                    GradientStop::new(1.0, Color::from_rgba8(16, 185, 129, 0)),
                 ],
                 SpreadMode::Pad,
                 Transform::identity(),
@@ -690,14 +713,14 @@ impl SplashState {
                 let mut paint = Paint::default();
                 paint.shader = glow;
                 pm.fill_rect(
-                    tiny_skia::Rect::from_xywh(0.0, 0.0, w as f32, (2.0 * sf).max(2.0)).unwrap(),
+                    tiny_skia::Rect::from_xywh(0.0, 0.0, w as f32, (2.5 * sf).max(2.0)).unwrap(),
                     &paint,
                     Transform::identity(),
                     None,
                 );
             }
 
-            // Inner glass card border
+            // Inner card border
             draw_rounded_stroke(
                 &mut pm,
                 0.5 * sf,
@@ -706,7 +729,11 @@ impl SplashState {
                 h as f32 - sf,
                 10.0 * sf,
                 1.0 * sf,
-                Color::from_rgba8(255, 255, 255, 24),
+                if dark {
+                    Color::from_rgba8(255, 255, 255, 24)
+                } else {
+                    Color::from_rgba8(15, 23, 42, 30)
+                },
             );
 
             // 2. Modern RHPicture vector icon badge on left with animated subtle ring
@@ -722,7 +749,11 @@ impl SplashState {
                 icon_sz + 6.0 * sf,
                 14.0 * sf,
                 1.6 * sf,
-                Color::from_rgba8(56, 189, 248, pulse_alpha),
+                if dark {
+                    Color::from_rgba8(56, 189, 248, pulse_alpha)
+                } else {
+                    Color::from_rgba8(14, 165, 233, pulse_alpha.saturating_add(25))
+                },
             );
             draw_rhpicture_emblem(&mut pm, icon_x, icon_y, icon_sz);
 
@@ -739,7 +770,11 @@ impl SplashState {
                 badge_w,
                 badge_h,
                 11.0 * sf,
-                Color::from_rgba8(14, 165, 233, 34),
+                if dark {
+                    Color::from_rgba8(14, 165, 233, 34)
+                } else {
+                    Color::from_rgba8(224, 242, 254, 255)
+                },
             );
             draw_rounded_stroke(
                 &mut pm,
@@ -749,7 +784,11 @@ impl SplashState {
                 badge_h,
                 11.0 * sf,
                 1.0 * sf,
-                Color::from_rgba8(56, 189, 248, 95),
+                if dark {
+                    Color::from_rgba8(56, 189, 248, 95)
+                } else {
+                    Color::from_rgba8(125, 211, 252, 255)
+                },
             );
 
             // 4. Minimalist 3-step indicator pills
@@ -766,12 +805,20 @@ impl SplashState {
                 let sx = 24.0 * sf + (i as f32) * (step_w + 8.0 * sf);
                 let done = i < current_step;
                 let active = i == current_step;
-                let fill = if done {
-                    Color::from_rgba8(16, 185, 129, 32)
+                let fill = if dark {
+                    if done {
+                        Color::from_rgba8(16, 185, 129, 32)
+                    } else if active {
+                        Color::from_rgba8(14, 165, 233, 38)
+                    } else {
+                        Color::from_rgba8(255, 255, 255, 10)
+                    }
+                } else if done {
+                    Color::from_rgba8(236, 253, 245, 255)
                 } else if active {
-                    Color::from_rgba8(14, 165, 233, 38)
+                    Color::from_rgba8(224, 242, 254, 255)
                 } else {
-                    Color::from_rgba8(255, 255, 255, 10)
+                    Color::from_rgba8(241, 245, 249, 255)
                 };
                 draw_rounded_fill(&mut pm, sx, step_y, step_w, step_h, 6.0 * sf, fill);
                 if active {
@@ -783,7 +830,26 @@ impl SplashState {
                         step_h,
                         6.0 * sf,
                         1.0 * sf,
-                        Color::from_rgba8(56, 189, 248, 110),
+                        if dark {
+                            Color::from_rgba8(56, 189, 248, 110)
+                        } else {
+                            Color::from_rgba8(56, 189, 248, 210)
+                        },
+                    );
+                } else if !dark {
+                    draw_rounded_stroke(
+                        &mut pm,
+                        sx,
+                        step_y,
+                        step_w,
+                        step_h,
+                        6.0 * sf,
+                        1.0 * sf,
+                        if done {
+                            Color::from_rgba8(167, 243, 208, 255)
+                        } else {
+                            Color::from_rgba8(226, 232, 240, 255)
+                        },
                     );
                 }
             }
@@ -800,7 +866,11 @@ impl SplashState {
                 bar_w,
                 bar_h,
                 bar_h * 0.5,
-                Color::from_rgba8(30, 41, 59, 255),
+                if dark {
+                    Color::from_rgba8(30, 41, 59, 255)
+                } else {
+                    Color::from_rgba8(226, 232, 240, 255)
+                },
             );
             let fill_w = (bar_w * self.display_progress.clamp(0.06, 1.0)).max(bar_h * 2.0);
             if let Some(bar_path) = rounded_path(bar_x, bar_y, fill_w, bar_h, bar_h * 0.5) {
@@ -890,7 +960,7 @@ impl SplashState {
                 right: s(178),
                 bottom: s(48),
             },
-            (248, 250, 252),
+            if dark { (248, 250, 252) } else { (15, 23, 42) },
             &self.font_title,
             DT_LEFT.0,
         );
@@ -904,7 +974,7 @@ impl SplashState {
                 right: s(180 + badge_w.round() as i32),
                 bottom: s(48),
             },
-            (125, 211, 252),
+            if dark { (125, 211, 252) } else { (3, 105, 161) },
             &self.font_badge,
             DT_CENTER.0,
         );
@@ -919,7 +989,7 @@ impl SplashState {
                 right: w - s(24),
                 bottom: s(74),
             },
-            (148, 163, 184),
+            if dark { (148, 163, 184) } else { (71, 85, 105) },
             &self.font_status,
             DT_LEFT.0,
         );
@@ -938,10 +1008,18 @@ impl SplashState {
             let done = i < current_step;
             let active = i == current_step;
             let prefix = if done { "✓ " } else if active { "● " } else { "○ " };
-            let col = if done {
-                (52, 211, 153)
+            let col = if dark {
+                if done {
+                    (52, 211, 153)
+                } else if active {
+                    (125, 211, 252)
+                } else {
+                    (100, 116, 139)
+                }
+            } else if done {
+                (5, 150, 105)
             } else if active {
-                (125, 211, 252)
+                (3, 105, 161)
             } else {
                 (100, 116, 139)
             };
@@ -961,7 +1039,7 @@ impl SplashState {
 
         // Footer row
         draw_txt(
-            "个人快捷键与配置已自动保留 · 零显存更新中",
+            "个人快捷键与配置已自动保留 · 轻量更新中",
             RECT {
                 left: s(24),
                 top: s(152),
@@ -982,7 +1060,7 @@ impl SplashState {
                 right: w - s(24),
                 bottom: s(176),
             },
-            (148, 163, 184),
+            if dark { (148, 163, 184) } else { (71, 85, 105) },
             &self.font_small,
             DT_RIGHT.0,
         );

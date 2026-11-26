@@ -1,5 +1,6 @@
 use crate::config::{AppConfig, PinDoubleClickAction};
 use crate::image_ops::{BgraImage, clipboard};
+use crate::popup_menu::{MenuEntry, MenuIcon, show_popup_menu};
 use crate::util::{
     DibSurface, OwnedFont, create_ui_font, current_hinstance, rgb_colorref, save_file_dialog,
     scale_dpi, timestamp_filename, to_wide, trim_working_set, window_dpi,
@@ -22,14 +23,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CS_DBLCLKS, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DestroyWindow, GetCursorPos, GetWindowLongW, GetWindowRect, GWL_EXSTYLE, HWND_TOPMOST,
-    IDC_SIZEALL, KillTimer, LWA_ALPHA, LoadCursorW, MF_CHECKED, MF_POPUP, MF_SEPARATOR,
-    MF_STRING, RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
-    SetWindowLongW, SetWindowPos, ShowWindow, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
-    TrackPopupMenu, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT,
+    CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowLongW,
+    GetWindowRect, GWL_EXSTYLE, HWND_TOPMOST, IDC_SIZEALL, KillTimer, LWA_ALPHA, LoadCursorW,
+    RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer, SetWindowLongW,
+    SetWindowPos, ShowWindow, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT,
     WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
@@ -467,7 +466,7 @@ impl PinWindow {
         self.storage.compress_for_hidden();
     }
 
-    fn paint(&mut self, show_border: bool) {
+    fn paint(&mut self, show_border: bool, dark_theme: bool) {
         let mut ps = PAINTSTRUCT::default();
         let hdc = unsafe { BeginPaint(self.hwnd, &mut ps) };
 
@@ -532,7 +531,7 @@ impl PinWindow {
 
             // Optional transient HUD pill (zoom / opacity / copied)
             if let Some(ref text) = self.hud_text {
-                draw_hud_pill(&mut surface, self.font_hud.0, dpi, text);
+                draw_hud_pill(&mut surface, self.font_hud.0, dpi, text, dark_theme);
             }
 
             unsafe {
@@ -572,6 +571,7 @@ fn draw_hud_pill(
     font: windows::Win32::Graphics::Gdi::HFONT,
     dpi: u32,
     text: &str,
+    dark_theme: bool,
 ) {
     let s = |v: i32| scale_dpi(v, dpi);
     let sf = dpi as f32 / 96.0;
@@ -599,12 +599,20 @@ fn draw_hud_pill(
         pb.close();
         if let Some(path) = pb.finish() {
             let mut paint = Paint::default();
-            paint.set_color(Color::from_rgba8(15, 23, 42, 232));
+            paint.set_color(if dark_theme {
+                Color::from_rgba8(15, 23, 42, 232)
+            } else {
+                Color::from_rgba8(255, 255, 255, 240)
+            });
             paint.anti_alias = true;
             pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
 
             let mut rim = Paint::default();
-            rim.set_color(Color::from_rgba8(255, 255, 255, 42));
+            rim.set_color(if dark_theme {
+                Color::from_rgba8(255, 255, 255, 42)
+            } else {
+                Color::from_rgba8(15, 23, 42, 34)
+            });
             rim.anti_alias = true;
             let st = Stroke {
                 width: (1.0 * sf).max(1.0),
@@ -654,7 +662,12 @@ fn draw_hud_pill(
     unsafe {
         let old = SelectObject(surface.dc, windows::Win32::Graphics::Gdi::HGDIOBJ(font.0));
         SetBkMode(surface.dc, TRANSPARENT);
-        SetTextColor(surface.dc, rgb_colorref(248, 250, 252));
+        let tc = if dark_theme {
+            (248, 250, 252)
+        } else {
+            (15, 23, 42)
+        };
+        SetTextColor(surface.dc, rgb_colorref(tc.0, tc.1, tc.2));
         let _ = DrawTextW(
             surface.dc,
             &mut wide[..wide.len() - 1].to_vec(),
@@ -719,76 +732,122 @@ fn copy_pin_image(hwnd: HWND) {
 }
 
 fn show_context_menu(hwnd: HWND) {
-    let (opacity, click_through) = MANAGER.with(|m| {
-        m.borrow()
+    let (opacity, click_through, dark_theme) = MANAGER.with(|m| {
+        let mgr = m.borrow();
+        let dark = mgr.config.theme.is_dark();
+        let (op, ct) = mgr
             .pins
             .get(&(hwnd.0 as isize))
             .map(|p| (p.opacity, p.click_through))
-            .unwrap_or((255, false))
+            .unwrap_or((255, false));
+        (op, ct, dark)
     });
 
-    let cmd = unsafe {
-        let Ok(menu) = CreatePopupMenu() else {
-            return;
-        };
-        let Ok(op_menu) = CreatePopupMenu() else {
-            let _ = DestroyMenu(menu);
-            return;
-        };
+    let op_pct = ((opacity as f64 / 255.0) * 100.0).round() as i32;
+    let entries = vec![
+        MenuEntry::Action {
+            id: MENU_COPY,
+            icon: MenuIcon::Copy,
+            label: "复制图像".into(),
+            shortcut: "Ctrl+C".into(),
+            enabled: true,
+            checked: false,
+            danger: false,
+        },
+        MenuEntry::Action {
+            id: MENU_SAVE,
+            icon: MenuIcon::Save,
+            label: "保存到本地…".into(),
+            shortcut: "Ctrl+S".into(),
+            enabled: true,
+            checked: false,
+            danger: false,
+        },
+        MenuEntry::Separator,
+        MenuEntry::Action {
+            id: MENU_RESET_ZOOM,
+            icon: MenuIcon::Reset,
+            label: "重置为 100%".into(),
+            shortcut: "0".into(),
+            enabled: true,
+            checked: false,
+            danger: false,
+        },
+        MenuEntry::Action {
+            id: MENU_ROTATE,
+            icon: MenuIcon::Rotate,
+            label: "顺时针旋转 90°".into(),
+            shortcut: "R".into(),
+            enabled: true,
+            checked: false,
+            danger: false,
+        },
+        MenuEntry::Chips {
+            icon: MenuIcon::Opacity,
+            label: "透明度（Ctrl+滚轮）".into(),
+            items: vec![
+                (MENU_OPACITY_100, "100%".into(), op_pct >= 93),
+                (MENU_OPACITY_85, "85%".into(), (78..93).contains(&op_pct)),
+                (MENU_OPACITY_70, "70%".into(), (60..78).contains(&op_pct)),
+                (MENU_OPACITY_50, "50%".into(), (40..60).contains(&op_pct)),
+                (MENU_OPACITY_30, "30%".into(), op_pct < 40),
+            ],
+        },
+        MenuEntry::Action {
+            id: MENU_CLICK_THROUGH,
+            icon: MenuIcon::Pointer,
+            label: "鼠标穿透（可从托盘恢复）".into(),
+            shortcut: String::new(),
+            enabled: true,
+            checked: click_through,
+            danger: false,
+        },
+        MenuEntry::Separator,
+        MenuEntry::Action {
+            id: MENU_HIDE,
+            icon: MenuIcon::EyeOff,
+            label: "隐藏此贴图".into(),
+            shortcut: "H".into(),
+            enabled: true,
+            checked: false,
+            danger: false,
+        },
+        MenuEntry::Action {
+            id: MENU_HIDE_ALL,
+            icon: MenuIcon::EyeOff,
+            label: "隐藏全部贴图".into(),
+            shortcut: String::new(),
+            enabled: true,
+            checked: false,
+            danger: false,
+        },
+        MenuEntry::Separator,
+        MenuEntry::Action {
+            id: MENU_CLOSE,
+            icon: MenuIcon::Close,
+            label: "关闭此贴图".into(),
+            shortcut: "Esc".into(),
+            enabled: true,
+            checked: false,
+            danger: true,
+        },
+        MenuEntry::Action {
+            id: MENU_CLOSE_ALL,
+            icon: MenuIcon::Close,
+            label: "关闭全部贴图".into(),
+            shortcut: String::new(),
+            enabled: true,
+            checked: false,
+            danger: true,
+        },
+    ];
 
-        let add = |hmenu, id: u32, text: &str, checked: bool| {
-            let w = to_wide(text);
-            let flags = if checked {
-                MF_STRING | MF_CHECKED
-            } else {
-                MF_STRING
-            };
-            let _ = AppendMenuW(hmenu, flags, id as usize, PCWSTR(w.as_ptr()));
-        };
-
-        add(menu, MENU_COPY, "复制图像\tCtrl+C", false);
-        add(menu, MENU_SAVE, "保存到本地...\tCtrl+S", false);
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        add(menu, MENU_RESET_ZOOM, "重置为 100%\t0", false);
-        add(menu, MENU_ROTATE, "顺时针旋转 90°\tR", false);
-
-        let op_pct = ((opacity as f64 / 255.0) * 100.0).round() as i32;
-        add(op_menu, MENU_OPACITY_100, "100% (不透明)", op_pct >= 93);
-        add(op_menu, MENU_OPACITY_85, "85%", (78..93).contains(&op_pct));
-        add(op_menu, MENU_OPACITY_70, "70%", (60..78).contains(&op_pct));
-        add(op_menu, MENU_OPACITY_50, "50%", (40..60).contains(&op_pct));
-        add(op_menu, MENU_OPACITY_30, "30%", op_pct < 40);
-        let op_title = to_wide("透明度 (Ctrl+滚轮)");
-        let _ = AppendMenuW(
-            menu,
-            MF_POPUP,
-            op_menu.0 as usize,
-            PCWSTR(op_title.as_ptr()),
-        );
-
-        add(menu, MENU_CLICK_THROUGH, "鼠标穿透（可从托盘恢复）", click_through);
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        add(menu, MENU_HIDE, "隐藏此贴图\tH", false);
-        add(menu, MENU_HIDE_ALL, "隐藏全部贴图", false);
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        add(menu, MENU_CLOSE, "关闭此贴图\tEsc", false);
-        add(menu, MENU_CLOSE_ALL, "关闭全部贴图", false);
-
-        let mut pt = POINT::default();
+    let mut pt = POINT::default();
+    unsafe {
         let _ = GetCursorPos(&mut pt);
-        let _ = SetForegroundWindow(hwnd);
-        let chosen = TrackPopupMenu(
-            menu,
-            TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD,
-            pt.x,
-            pt.y,
-            Some(0),
-            hwnd,
-            None,
-        )
-        .0 as u32;
-        let _ = DestroyMenu(menu);
-        chosen
+    }
+    let Some(cmd) = show_popup_menu(hwnd, pt.x, pt.y, entries, dark_theme) else {
+        return;
     };
 
     match cmd {
@@ -915,8 +974,9 @@ unsafe extern "system" fn pin_wnd_proc(
             MANAGER.with(|m| {
                 let mut mgr = m.borrow_mut();
                 let show_border = mgr.config.pin_show_border;
+                let dark_theme = mgr.config.theme.is_dark();
                 if let Some(pin) = mgr.pins.get_mut(&(hwnd.0 as isize)) {
-                    pin.paint(show_border);
+                    pin.paint(show_border, dark_theme);
                 }
             });
             return LRESULT(0);

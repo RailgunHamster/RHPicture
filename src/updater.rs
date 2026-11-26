@@ -1049,10 +1049,12 @@ impl UpdateService {
         )
         .ok()
         .and_then(|locator| {
+            let dark_theme = crate::config::AppConfig::load().theme.is_dark();
             crate::update_splash::launch(
                 &manager.get_current_version_as_string(),
                 &pending.Version,
                 &locator.get_root_dir(),
+                dark_theme,
             )
         });
         #[cfg(windows)]

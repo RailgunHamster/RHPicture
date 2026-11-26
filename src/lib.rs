@@ -7,6 +7,8 @@ pub mod overlay;
 #[cfg(windows)]
 pub mod pin;
 #[cfg(windows)]
+pub mod popup_menu;
+#[cfg(windows)]
 pub mod settings_ui;
 #[cfg(windows)]
 pub mod tray;

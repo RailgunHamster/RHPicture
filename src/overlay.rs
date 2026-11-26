@@ -12,9 +12,21 @@ use tiny_skia::{
     Point, SpreadMode, Stroke, Transform,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Direct2D::Common::{
+    D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
+    D2D_RECT_F, D2D_SIZE_U,
+};
+use windows::Win32::Graphics::Direct2D::{
+    D2D1CreateFactory, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_BITMAP_PROPERTIES,
+    D2D1_ELLIPSE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
+    D2D1_PRESENT_OPTIONS_IMMEDIATELY, D2D1_RENDER_TARGET_PROPERTIES,
+    D2D1_RENDER_TARGET_TYPE_DEFAULT, ID2D1Bitmap, ID2D1Factory, ID2D1HwndRenderTarget,
+    ID2D1SolidColorBrush,
+};
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, DT_CENTER, DT_LEFT, DT_NOCLIP, DT_SINGLELINE, DT_VCENTER, DrawTextW,
-    EndPaint, InvalidateRect, PAINTSTRUCT, SRCCOPY, SelectObject, SetBkMode, SetTextColor,
+    EndPaint, HDC, InvalidateRect, PAINTSTRUCT, SRCCOPY, SelectObject, SetBkMode, SetTextColor,
     TRANSPARENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -27,7 +39,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LoadCursorW, RegisterClassExW, SW_SHOW, SetCursor, SetForegroundWindow, SetWindowPos,
     ShowWindow, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR,
-    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE, HWND_TOPMOST,
+    WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, HWND_TOPMOST,
     SWP_SHOWWINDOW,
 };
 use windows::core::PCWSTR;
@@ -75,14 +87,190 @@ struct ToolbarButton {
     label: &'static str,
 }
 
+struct CachedGpuBitmap<K: PartialEq> {
+    key: K,
+    bmp: ID2D1Bitmap,
+    width: i32,
+    height: i32,
+}
+
+/// Hardware-accelerated Direct2D renderer active ONLY while the screenshot overlay is open.
+/// Dropped immediately on overlay exit so idle/pinned VRAM stays at 0 MB.
+struct GpuOverlay {
+    _factory: ID2D1Factory,
+    rt: ID2D1HwndRenderTarget,
+    src_bitmap: ID2D1Bitmap,
+    dim_brush: ID2D1SolidColorBrush,
+    halo_brush: ID2D1SolidColorBrush,
+    border_brush: ID2D1SolidColorBrush,
+    corner_brush: ID2D1SolidColorBrush,
+    white_brush: ID2D1SolidColorBrush,
+    handle_ring_brush: ID2D1SolidColorBrush,
+    handle_shadow_brush: ID2D1SolidColorBrush,
+
+    top_hint_cache: Option<CachedGpuBitmap<(u32, bool)>>,
+    size_badge_cache: Option<CachedGpuBitmap<(i32, i32, u32, bool)>>,
+    toolbar_cache: Option<CachedGpuBitmap<(Option<ToolbarAction>, u32, bool)>>,
+    magnifier_cache: Option<CachedGpuBitmap<(i32, i32, u32, bool)>>,
+}
+
+impl GpuOverlay {
+    fn new(hwnd: HWND, image: &BgraImage) -> Option<Self> {
+        // D3D11 max 2D texture dimension is 16384; fall back to CPU on extreme multi-display walls
+        if image.width == 0 || image.height == 0 || image.width > 16384 || image.height > 16384 {
+            return None;
+        }
+        let factory: ID2D1Factory =
+            unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).ok()? };
+        let rt_props = D2D1_RENDER_TARGET_PROPERTIES {
+            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_IGNORE,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            ..Default::default()
+        };
+        let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
+            hwnd,
+            pixelSize: D2D_SIZE_U {
+                width: image.width,
+                height: image.height,
+            },
+            presentOptions: D2D1_PRESENT_OPTIONS_IMMEDIATELY,
+        };
+        let rt = unsafe { factory.CreateHwndRenderTarget(&rt_props, &hwnd_props).ok()? };
+        unsafe {
+            rt.SetDpi(96.0, 96.0);
+        }
+
+        let bmp_props = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_IGNORE,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        let src_bitmap = unsafe {
+            rt.CreateBitmap(
+                D2D_SIZE_U {
+                    width: image.width,
+                    height: image.height,
+                },
+                Some(image.data.as_ptr() as *const _),
+                image.width * 4,
+                &bmp_props,
+            )
+            .ok()?
+        };
+
+        let make_brush = |r: f32, g: f32, b: f32, a: f32| -> Option<ID2D1SolidColorBrush> {
+            unsafe {
+                rt.CreateSolidColorBrush(&D2D1_COLOR_F { r, g, b, a }, None)
+                    .ok()
+            }
+        };
+
+        Some(Self {
+            _factory: factory,
+            dim_brush: make_brush(0.0, 0.0, 0.0, 0.52)?,
+            halo_brush: make_brush(15.0 / 255.0, 23.0 / 255.0, 42.0 / 255.0, 0.72)?,
+            border_brush: make_brush(56.0 / 255.0, 189.0 / 255.0, 248.0 / 255.0, 1.0)?,
+            corner_brush: make_brush(125.0 / 255.0, 211.0 / 255.0, 252.0 / 255.0, 1.0)?,
+            white_brush: make_brush(1.0, 1.0, 1.0, 1.0)?,
+            handle_ring_brush: make_brush(14.0 / 255.0, 165.0 / 255.0, 233.0 / 255.0, 1.0)?,
+            handle_shadow_brush: make_brush(0.0, 0.0, 0.0, 0.30)?,
+            rt,
+            src_bitmap,
+            top_hint_cache: None,
+            size_badge_cache: None,
+            toolbar_cache: None,
+            magnifier_cache: None,
+        })
+    }
+
+    fn upload_widget_bitmap(
+        rt: &ID2D1HwndRenderTarget,
+        pm: &Pixmap,
+        draw_gdi: impl FnOnce(&mut DibSurface),
+    ) -> Option<ID2D1Bitmap> {
+        let w = pm.width() as i32;
+        let h = pm.height() as i32;
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+        let mut surface = DibSurface::new(w, h)?;
+        let src = pm.data(); // premultiplied RGBA
+        {
+            let dst = surface.pixels_mut();
+            for (spx, dpx) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                dpx[0] = spx[2];
+                dpx[1] = spx[1];
+                dpx[2] = spx[0];
+                dpx[3] = spx[3];
+            }
+        }
+        draw_gdi(&mut surface);
+        // Restore premultiplied alpha cleanly: GDI ClearType zeros alpha on touched pixels inside the card.
+        {
+            let dst = surface.pixels_mut();
+            for (spx, dpx) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                let orig_a = spx[3];
+                if orig_a >= 210 && dpx[3] == 0 {
+                    dpx[3] = 255;
+                } else {
+                    dpx[3] = orig_a;
+                    // Clamp premultiplied channels to alpha
+                    if dpx[0] > orig_a {
+                        dpx[0] = orig_a;
+                    }
+                    if dpx[1] > orig_a {
+                        dpx[1] = orig_a;
+                    }
+                    if dpx[2] > orig_a {
+                        dpx[2] = orig_a;
+                    }
+                }
+            }
+        }
+        let bmp_props = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        unsafe {
+            rt.CreateBitmap(
+                D2D_SIZE_U {
+                    width: w as u32,
+                    height: h as u32,
+                },
+                Some(surface.pixels_mut().as_ptr() as *const _),
+                (w as u32) * 4,
+                &bmp_props,
+            )
+            .ok()
+        }
+    }
+}
+
 struct OverlayState {
     hwnd: HWND,
     capture: ScreenCapture,
-    surface: DibSurface,
+    gpu: Option<GpuOverlay>,
+    /// Lazy CPU fallback buffers (only allocated if Direct2D GPU init fails or in unit tests).
+    surface: Option<DibSurface>,
+    dimmed_bg: Option<Vec<u8>>,
     /// Per-DPI cached (ui_10pt, small_9pt) ClearType fonts so mixed-DPI monitors render sharply.
     fonts: HashMap<u32, (OwnedFont, OwnedFont)>,
     show_magnifier: bool,
     smart_window_detect: bool,
+    dark_theme: bool,
+    dirty: bool,
 
     selection: Option<RectI>,
     hover_rect: Option<RectI>,
@@ -129,6 +317,7 @@ pub fn is_overlay_active() -> bool {
 pub fn start_screenshot_overlay(
     smart_window_detect: bool,
     show_magnifier: bool,
+    dark_theme: bool,
     on_finish: impl FnOnce(OverlayOutcome) + 'static,
 ) -> Result<(), String> {
     if is_overlay_active() {
@@ -142,7 +331,6 @@ pub fn start_screenshot_overlay(
     let origin_x = capture.origin_x;
     let origin_y = capture.origin_y;
 
-    let surface = DibSurface::new(width, height).ok_or_else(|| "无法创建绘制缓冲".to_string())?;
     let mut fonts = HashMap::new();
     for m in &capture.monitors {
         fonts.entry(m.dpi).or_insert_with(|| {
@@ -171,10 +359,14 @@ pub fn start_screenshot_overlay(
     let mut state = Box::new(OverlayState {
         hwnd: HWND::default(),
         capture,
-        surface,
+        gpu: None,
+        surface: None,
+        dimmed_bg: None,
         fonts,
         show_magnifier,
         smart_window_detect,
+        dark_theme,
+        dirty: true,
         selection: None,
         hover_rect: None,
         drag_mode: DragMode::None,
@@ -189,7 +381,6 @@ pub fn start_screenshot_overlay(
         finished: false,
     });
     state.update_hover_rect();
-    state.render();
 
     ACTIVE_OVERLAY.with(|cell| {
         *cell.borrow_mut() = Some(state);
@@ -202,7 +393,7 @@ pub fn start_screenshot_overlay(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             PCWSTR(class_w.as_ptr()),
             PCWSTR(title_w.as_ptr()),
-            WS_POPUP | WS_VISIBLE,
+            WS_POPUP,
             origin_x,
             origin_y,
             width,
@@ -224,6 +415,10 @@ pub fn start_screenshot_overlay(
     ACTIVE_OVERLAY.with(|cell| {
         if let Some(s) = cell.borrow_mut().as_mut() {
             s.hwnd = hwnd;
+            s.gpu = GpuOverlay::new(hwnd, &s.capture.image);
+            if s.gpu.is_none() {
+                s.ensure_cpu_buffers();
+            }
         }
     });
 
@@ -399,25 +594,943 @@ impl OverlayState {
             .map(|b| b.action)
     }
 
+    fn ensure_cpu_buffers(&mut self) -> bool {
+        let w = self.capture.image.width as i32;
+        let h = self.capture.image.height as i32;
+        if self.surface.is_none() {
+            self.surface = DibSurface::new(w, h);
+        }
+        if self.dimmed_bg.is_none() {
+            let src = &self.capture.image.data;
+            let mut dim = vec![0u8; src.len()];
+            for (s, d) in src.chunks_exact(4).zip(dim.chunks_exact_mut(4)) {
+                d[0] = ((s[0] as u16 * 124) >> 8) as u8;
+                d[1] = ((s[1] as u16 * 124) >> 8) as u8;
+                d[2] = ((s[2] as u16 * 124) >> 8) as u8;
+                d[3] = 255;
+            }
+            self.dimmed_bg = Some(dim);
+        }
+        self.surface.is_some()
+    }
+
+    fn render_cpu_and_blit(&mut self, hdc: HDC, paint_rect: RECT) {
+        if !self.ensure_cpu_buffers() {
+            return;
+        }
+        if self.dirty {
+            self.render();
+            self.dirty = false;
+        }
+        if let Some(ref surface) = self.surface {
+            let x = paint_rect.left.clamp(0, surface.width);
+            let y = paint_rect.top.clamp(0, surface.height);
+            let r = paint_rect.right.clamp(x, surface.width);
+            let b = paint_rect.bottom.clamp(y, surface.height);
+            let bw = (r - x).max(0);
+            let bh = (b - y).max(0);
+            if bw > 0 && bh > 0 {
+                unsafe {
+                    let _ = BitBlt(hdc, x, y, bw, bh, Some(surface.dc), x, y, SRCCOPY);
+                }
+            }
+        }
+    }
+
+    fn render_gpu(&mut self) -> bool {
+        self.layout_toolbar();
+        if self.gpu.is_none() {
+            return false;
+        }
+
+        let bounds = self.bounds();
+        let w = bounds.width() as f32;
+        let h = bounds.height() as f32;
+        let active_rect = self.selection.or(self.hover_rect).map(|r| r.intersect(bounds));
+        let is_confirmed = self.selection.is_some();
+        let show_top_hint = self.selection.is_none() && self.drag_mode == DragMode::None;
+        let show_loupe = self.show_magnifier
+            && bounds.width() > 20
+            && bounds.height() > 20
+            && (self.selection.is_none()
+                || matches!(
+                    self.drag_mode,
+                    DragMode::Creating
+                        | DragMode::ResizeN
+                        | DragMode::ResizeS
+                        | DragMode::ResizeW
+                        | DragMode::ResizeE
+                        | DragMode::ResizeNW
+                        | DragMode::ResizeNE
+                        | DragMode::ResizeSW
+                        | DragMode::ResizeSE
+                ));
+
+        // Pre-compute widget placements & ensure cached GPU bitmaps BEFORE BeginDraw
+        let top_hint_pos = if show_top_hint {
+            let mon_info = self.monitor_info_for_point(self.cursor_pos.0, self.cursor_pos.1);
+            let dpi = mon_info.dpi;
+            let s = |v: i32| scale_dpi(v, dpi);
+            let pill_w = s(370).min(mon_info.rect.width() - s(24));
+            let pill_h = s(30);
+            let shadow = s(10);
+            let px = mon_info.rect.left + (mon_info.rect.width() - pill_w) / 2;
+            let py = mon_info.rect.top + s(18);
+            self.ensure_gpu_top_hint(dpi, pill_w, pill_h, shadow);
+            Some((px - shadow, py - shadow))
+        } else {
+            None
+        };
+
+        let size_badge_pos = if let Some(r) = active_rect.filter(|r| !r.is_empty()) {
+            let mon_info = self.monitor_info_for_point(r.left, r.top);
+            let mon = mon_info.rect;
+            let dpi = mon_info.dpi;
+            let s = |v: i32| scale_dpi(v, dpi);
+            let text = format!("{} × {}", r.width(), r.height());
+            let badge_w = s(106).max(s((text.chars().count() as i32) * 8 + 28));
+            let badge_h = s(28);
+            let shadow = s(8);
+            let pad_edge = s(6);
+            let gap = s(8);
+            let bx = r
+                .left
+                .clamp(mon.left + pad_edge, (mon.right - badge_w - pad_edge).max(mon.left + pad_edge));
+            let by = if r.top - badge_h - gap >= mon.top + pad_edge {
+                r.top - badge_h - gap
+            } else {
+                r.top + gap
+            };
+            self.ensure_gpu_size_badge(r.width(), r.height(), dpi, badge_w, badge_h, shadow);
+            Some((bx - shadow, by - shadow))
+        } else {
+            None
+        };
+
+        let toolbar_pos = if !self.toolbar_rect.is_empty() {
+            let dpi = self.toolbar_dpi;
+            let shadow = scale_dpi(12, dpi);
+            self.ensure_gpu_toolbar(dpi, shadow);
+            Some((self.toolbar_rect.left - shadow, self.toolbar_rect.top - shadow))
+        } else {
+            None
+        };
+
+        let magnifier_pos = if show_loupe {
+            let (cx, cy) = self.cursor_pos;
+            let mon_info = self.monitor_info_for_point(cx, cy);
+            let mon = mon_info.rect;
+            let dpi = mon_info.dpi;
+            let s = |v: i32| scale_dpi(v, dpi);
+            let zoom = s(9).max(8);
+            let view_w = 17 * zoom;
+            let view_h = 11 * zoom;
+            let pad = s(8);
+            let info_h = s(52);
+            let total_w = view_w.max(s(176)) + pad * 2;
+            let total_h = view_h + info_h + pad * 2;
+            let shadow = s(12);
+            let offset = s(22);
+            let edge_pad = s(10);
+            let mut mx = cx + offset;
+            let mut my = cy + offset;
+            if mx + total_w > mon.right - edge_pad {
+                mx = cx - offset - total_w;
+            }
+            if my + total_h > mon.bottom - edge_pad {
+                my = cy - offset - total_h;
+            }
+            mx = mx.clamp(mon.left + s(6), (mon.right - total_w - s(6)).max(mon.left + s(6)));
+            my = my.clamp(mon.top + s(6), (mon.bottom - total_h - s(6)).max(mon.top + s(6)));
+            self.ensure_gpu_magnifier(cx, cy, dpi, zoom, pad, info_h, total_w, total_h, shadow);
+            Some((mx - shadow, my - shadow))
+        } else {
+            None
+        };
+
+        let active_dpi = active_rect
+            .filter(|r| !r.is_empty())
+            .map(|r| {
+                self.monitor_info_for_point((r.left + r.right) / 2, (r.top + r.bottom) / 2)
+                    .dpi
+            })
+            .unwrap_or(96);
+
+        let end_res = {
+            let Some(gpu) = self.gpu.as_ref() else {
+                return false;
+            };
+            let rt = &gpu.rt;
+            unsafe {
+                rt.BeginDraw();
+
+                // 1. Full desktop bitmap on GPU (~0.1 ms)
+                let full_rect = D2D_RECT_F {
+                    left: 0.0,
+                    top: 0.0,
+                    right: w,
+                    bottom: h,
+                };
+                rt.DrawBitmap(
+                    &gpu.src_bitmap,
+                    Some(&full_rect),
+                    1.0,
+                    D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                    None,
+                );
+
+                // 2. Dimmed mask strips around active selection/hover rect on GPU (~0.05 ms)
+                if let Some(r) = active_rect.filter(|r| !r.is_empty()) {
+                    let rl = r.left as f32;
+                    let rt_y = r.top as f32;
+                    let rr = r.right as f32;
+                    let rb = r.bottom as f32;
+                    if rt_y > 0.0 {
+                        rt.FillRectangle(
+                            &D2D_RECT_F { left: 0.0, top: 0.0, right: w, bottom: rt_y },
+                            &gpu.dim_brush,
+                        );
+                    }
+                    if rb < h {
+                        rt.FillRectangle(
+                            &D2D_RECT_F { left: 0.0, top: rb, right: w, bottom: h },
+                            &gpu.dim_brush,
+                        );
+                    }
+                    if rl > 0.0 {
+                        rt.FillRectangle(
+                            &D2D_RECT_F { left: 0.0, top: rt_y, right: rl, bottom: rb },
+                            &gpu.dim_brush,
+                        );
+                    }
+                    if rr < w {
+                        rt.FillRectangle(
+                            &D2D_RECT_F { left: rr, top: rt_y, right: w, bottom: rb },
+                            &gpu.dim_brush,
+                        );
+                    }
+
+                    // 3. Outer dark contrast halo + crisp sky-cyan border
+                    let s = |v: i32| scale_dpi(v, active_dpi) as f32;
+                    let sf = active_dpi as f32 / 96.0;
+                    let halo = s(1).max(1.0);
+                    let border_w = s(2).max(2.0);
+
+                    rt.DrawRectangle(
+                        &D2D_RECT_F {
+                            left: rl - halo * 0.5,
+                            top: rt_y - halo * 0.5,
+                            right: rr + halo * 0.5,
+                            bottom: rb + halo * 0.5,
+                        },
+                        &gpu.halo_brush,
+                        halo,
+                        None,
+                    );
+                    rt.DrawRectangle(
+                        &D2D_RECT_F {
+                            left: rl + border_w * 0.5,
+                            top: rt_y + border_w * 0.5,
+                            right: rr - border_w * 0.5,
+                            bottom: rb - border_w * 0.5,
+                        },
+                        &gpu.border_brush,
+                        border_w,
+                        None,
+                    );
+
+                    if !is_confirmed {
+                        // Modern viewfinder L-corners for hover window highlight
+                        let arm = s(16)
+                            .min((r.width() / 3) as f32)
+                            .min((r.height() / 3) as f32)
+                            .max(4.0);
+                        let bt = s(3).max(3.0);
+                        let corners = [
+                            D2D_RECT_F { left: rl, top: rt_y, right: rl + arm, bottom: rt_y + bt },
+                            D2D_RECT_F { left: rl, top: rt_y, right: rl + bt, bottom: rt_y + arm },
+                            D2D_RECT_F { left: rr - arm, top: rt_y, right: rr, bottom: rt_y + bt },
+                            D2D_RECT_F { left: rr - bt, top: rt_y, right: rr, bottom: rt_y + arm },
+                            D2D_RECT_F { left: rl, top: rb - bt, right: rl + arm, bottom: rb },
+                            D2D_RECT_F { left: rl, top: rb - arm, right: rl + bt, bottom: rb },
+                            D2D_RECT_F { left: rr - arm, top: rb - bt, right: rr, bottom: rb },
+                            D2D_RECT_F { left: rr - bt, top: rb - arm, right: rr, bottom: rb },
+                        ];
+                        for c in &corners {
+                            rt.FillRectangle(c, &gpu.corner_brush);
+                        }
+                    } else if self.drag_mode == DragMode::None {
+                        // Anti-aliased floating circular resize handles directly on GPU
+                        let mx = (rl + rr) * 0.5;
+                        let my = (rt_y + rb) * 0.5;
+                        let pts = [
+                            (rl, rt_y),
+                            (mx, rt_y),
+                            (rr, rt_y),
+                            (rl, my),
+                            (rr, my),
+                            (rl, rb),
+                            (mx, rb),
+                            (rr, rb),
+                        ];
+                        let hr = 4.8 * sf;
+                        let sr = 5.6 * sf;
+                        for (hx, hy) in pts {
+                            let mut sh_ell = D2D1_ELLIPSE {
+                                radiusX: sr,
+                                radiusY: sr,
+                                ..Default::default()
+                            };
+                            sh_ell.point.X = hx;
+                            sh_ell.point.Y = hy + 1.2 * sf;
+                            rt.FillEllipse(&sh_ell, &gpu.handle_shadow_brush);
+
+                            let mut ell = D2D1_ELLIPSE {
+                                radiusX: hr,
+                                radiusY: hr,
+                                ..Default::default()
+                            };
+                            ell.point.X = hx;
+                            ell.point.Y = hy;
+                            rt.FillEllipse(&ell, &gpu.white_brush);
+                            rt.DrawEllipse(&ell, &gpu.handle_ring_brush, 1.8 * sf, None);
+                        }
+                    }
+                } else {
+                    rt.FillRectangle(&full_rect, &gpu.dim_brush);
+                }
+
+                // 4. Composite cached floating glass widgets on GPU
+                let draw_cached = |pos: Option<(i32, i32)>, bmp: &ID2D1Bitmap, bw: i32, bh: i32| {
+                    if let Some((x, y)) = pos {
+                        let dst = D2D_RECT_F {
+                            left: x as f32,
+                            top: y as f32,
+                            right: (x + bw) as f32,
+                            bottom: (y + bh) as f32,
+                        };
+                        rt.DrawBitmap(
+                            bmp,
+                            Some(&dst),
+                            1.0,
+                            D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                            None,
+                        );
+                    }
+                };
+                if let Some(ref c) = gpu.size_badge_cache {
+                    draw_cached(size_badge_pos, &c.bmp, c.width, c.height);
+                }
+                if let Some(ref c) = gpu.top_hint_cache {
+                    draw_cached(top_hint_pos, &c.bmp, c.width, c.height);
+                }
+                if let Some(ref c) = gpu.toolbar_cache {
+                    draw_cached(toolbar_pos, &c.bmp, c.width, c.height);
+                }
+                if let Some(ref c) = gpu.magnifier_cache {
+                    draw_cached(magnifier_pos, &c.bmp, c.width, c.height);
+                }
+
+                rt.EndDraw(None, None)
+            }
+        };
+
+        self.dirty = false;
+        if let Err(err) = end_res {
+            // D2DERR_RECREATE_TARGET (0x8899000C) -> recreate device resources cleanly
+            if err.code().0 as u32 == 0x8899_000C {
+                self.gpu = GpuOverlay::new(self.hwnd, &self.capture.image);
+                self.dirty = true;
+                return false;
+            }
+        }
+        true
+    }
+
+    fn draw_text_on_dc(
+        &self,
+        dc: HDC,
+        text: &str,
+        rect: RectI,
+        color: (u8, u8, u8),
+        dpi: u32,
+        small: bool,
+        centered: bool,
+    ) {
+        let wide = to_wide(text);
+        let mut r = RECT {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+        };
+        unsafe {
+            let font = self.font_for_dpi(dpi, small);
+            let old = SelectObject(dc, windows::Win32::Graphics::Gdi::HGDIOBJ(font.0));
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, rgb_colorref(color.0, color.1, color.2));
+            let flags = if centered {
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP
+            } else {
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP
+            };
+            let _ = DrawTextW(
+                dc,
+                &mut wide[..wide.len() - 1].to_vec(),
+                &mut r,
+                flags,
+            );
+            let _ = SelectObject(dc, old);
+        }
+    }
+
+    fn ensure_gpu_top_hint(&mut self, dpi: u32, pill_w: i32, pill_h: i32, shadow: i32) {
+        let key = (dpi, self.dark_theme);
+        if self
+            .gpu
+            .as_ref()
+            .and_then(|g| g.top_hint_cache.as_ref())
+            .is_some_and(|c| c.key == key)
+        {
+            return;
+        }
+        let sf = dpi as f32 / 96.0;
+        let tw = pill_w + shadow * 2;
+        let th = pill_h + shadow * 2;
+        let Some(mut pm) = Pixmap::new(tw as u32, th as u32) else {
+            return;
+        };
+        let (bg, border, txt_col) = if self.dark_theme {
+            (
+                Color::from_rgba8(15, 23, 42, 226),
+                Color::from_rgba8(255, 255, 255, 36),
+                (226, 232, 240),
+            )
+        } else {
+            (
+                Color::from_rgba8(255, 255, 255, 242),
+                Color::from_rgba8(15, 23, 42, 34),
+                (15, 23, 42),
+            )
+        };
+        let ox = shadow as f32;
+        let oy = shadow as f32;
+        draw_soft_shadow(&mut pm, ox, oy, pill_w as f32, pill_h as f32, 15.0 * sf, sf);
+        fill_rounded_rect(&mut pm, ox, oy, pill_w as f32, pill_h as f32, 15.0 * sf, bg);
+        stroke_rounded_rect(
+            &mut pm,
+            ox + 0.5 * sf,
+            oy + 0.5 * sf,
+            pill_w as f32 - sf,
+            pill_h as f32 - sf,
+            14.5 * sf,
+            1.0 * sf,
+            border,
+        );
+        let rt = self.gpu.as_ref().map(|g| g.rt.clone());
+        if let Some(rt) = rt {
+            if let Some(bmp) = GpuOverlay::upload_widget_bitmap(&rt, &pm, |surf| {
+                self.draw_text_on_dc(
+                    surf.dc,
+                    "单击选中窗口 · 拖拽自由框选 · 按 C 取色 · 右键 / Esc 退出",
+                    RectI::new(shadow, shadow, shadow + pill_w, shadow + pill_h),
+                    txt_col,
+                    dpi,
+                    true,
+                    true,
+                );
+            }) {
+                if let Some(g) = self.gpu.as_mut() {
+                    g.top_hint_cache = Some(CachedGpuBitmap {
+                        key,
+                        bmp,
+                        width: tw,
+                        height: th,
+                    });
+                }
+            }
+        }
+    }
+
+    fn ensure_gpu_size_badge(
+        &mut self,
+        sel_w: i32,
+        sel_h: i32,
+        dpi: u32,
+        badge_w: i32,
+        badge_h: i32,
+        shadow: i32,
+    ) {
+        let key = (sel_w, sel_h, dpi, self.dark_theme);
+        if self
+            .gpu
+            .as_ref()
+            .and_then(|g| g.size_badge_cache.as_ref())
+            .is_some_and(|c| c.key == key)
+        {
+            return;
+        }
+        let s = |v: i32| scale_dpi(v, dpi);
+        let sf = dpi as f32 / 96.0;
+        let tw = badge_w + shadow * 2;
+        let th = badge_h + shadow * 2;
+        let Some(mut pm) = Pixmap::new(tw as u32, th as u32) else {
+            return;
+        };
+        let (bg, border, dot_col, txt_col) = if self.dark_theme {
+            (
+                Color::from_rgba8(15, 23, 42, 234),
+                Color::from_rgba8(255, 255, 255, 36),
+                Color::from_rgba8(56, 189, 248, 255),
+                (248, 250, 252),
+            )
+        } else {
+            (
+                Color::from_rgba8(255, 255, 255, 246),
+                Color::from_rgba8(15, 23, 42, 34),
+                Color::from_rgba8(2, 132, 199, 255),
+                (15, 23, 42),
+            )
+        };
+        let ox = shadow as f32;
+        let oy = shadow as f32;
+        draw_soft_shadow(&mut pm, ox, oy, badge_w as f32, badge_h as f32, 8.0 * sf, sf);
+        fill_rounded_rect(&mut pm, ox, oy, badge_w as f32, badge_h as f32, 8.0 * sf, bg);
+        stroke_rounded_rect(
+            &mut pm,
+            ox + 0.5 * sf,
+            oy + 0.5 * sf,
+            badge_w as f32 - sf,
+            badge_h as f32 - sf,
+            7.5 * sf,
+            1.0 * sf,
+            border,
+        );
+        if let Some(dot) = PathBuilder::from_circle(
+            ox + 11.0 * sf,
+            oy + (badge_h as f32) * 0.5,
+            3.0 * sf,
+        ) {
+            let mut paint = Paint::default();
+            paint.set_color(dot_col);
+            paint.anti_alias = true;
+            pm.fill_path(&dot, &paint, FillRule::Winding, Transform::identity(), None);
+        }
+        let text = format!("{sel_w} × {sel_h}");
+        let rt = self.gpu.as_ref().map(|g| g.rt.clone());
+        if let Some(rt) = rt {
+            if let Some(bmp) = GpuOverlay::upload_widget_bitmap(&rt, &pm, |surf| {
+                self.draw_text_on_dc(
+                    surf.dc,
+                    &text,
+                    RectI::new(shadow + s(16), shadow, shadow + badge_w - s(6), shadow + badge_h),
+                    txt_col,
+                    dpi,
+                    true,
+                    true,
+                );
+            }) {
+                if let Some(g) = self.gpu.as_mut() {
+                    g.size_badge_cache = Some(CachedGpuBitmap {
+                        key,
+                        bmp,
+                        width: tw,
+                        height: th,
+                    });
+                }
+            }
+        }
+    }
+
+    fn ensure_gpu_toolbar(&mut self, dpi: u32, shadow: i32) {
+        let key = (self.hovered_button, dpi, self.dark_theme);
+        let tb = self.toolbar_rect;
+        let tw = tb.width();
+        let th = tb.height();
+        if tw <= 0 || th <= 0 {
+            return;
+        }
+        let full_w = tw + shadow * 2;
+        let full_h = th + shadow * 2;
+        if self
+            .gpu
+            .as_ref()
+            .and_then(|g| g.toolbar_cache.as_ref())
+            .is_some_and(|c| c.key == key && c.width == full_w && c.height == full_h)
+        {
+            return;
+        }
+        let sf = dpi as f32 / 96.0;
+        let s = |v: i32| scale_dpi(v, dpi);
+        let Some(mut pm) = Pixmap::new(full_w as u32, full_h as u32) else {
+            return;
+        };
+        let ox = shadow as f32;
+        let oy = shadow as f32;
+        draw_soft_shadow(&mut pm, ox, oy, tw as f32, th as f32, 12.0 * sf, sf);
+
+        let (dock_bg, dock_border, div_col, hover_bg) = if self.dark_theme {
+            (
+                Color::from_rgba8(15, 23, 42, 240),
+                Color::from_rgba8(255, 255, 255, 38),
+                Color::from_rgba8(255, 255, 255, 32),
+                Color::from_rgba8(255, 255, 255, 30),
+            )
+        } else {
+            (
+                Color::from_rgba8(255, 255, 255, 248),
+                Color::from_rgba8(15, 23, 42, 34),
+                Color::from_rgba8(15, 23, 42, 26),
+                Color::from_rgba8(15, 23, 42, 16),
+            )
+        };
+        fill_rounded_rect(&mut pm, ox, oy, tw as f32, th as f32, 12.0 * sf, dock_bg);
+        stroke_rounded_rect(
+            &mut pm,
+            ox + 0.5 * sf,
+            oy + 0.5 * sf,
+            tw as f32 - sf,
+            th as f32 - sf,
+            11.5 * sf,
+            1.0 * sf,
+            dock_border,
+        );
+        if let Some(cancel_btn) = self.buttons.get(3) {
+            let div_x = ox + (cancel_btn.rect.left - tb.left) as f32 - 5.5 * sf;
+            fill_rounded_rect(
+                &mut pm,
+                div_x,
+                oy + 10.0 * sf,
+                (1.0 * sf).max(1.0),
+                th as f32 - 20.0 * sf,
+                0.5 * sf,
+                div_col,
+            );
+        }
+        for btn in &self.buttons {
+            let lx = ox + (btn.rect.left - tb.left) as f32;
+            let ly = oy + (btn.rect.top - tb.top) as f32;
+            let bw = btn.rect.width() as f32;
+            let bh = btn.rect.height() as f32;
+            let hovered = self.hovered_button == Some(btn.action);
+            if btn.action == ToolbarAction::Copy {
+                let (c0, c1) = if hovered {
+                    (Color::from_rgba8(56, 189, 248, 255), Color::from_rgba8(37, 99, 235, 255))
+                } else {
+                    (Color::from_rgba8(14, 165, 233, 248), Color::from_rgba8(37, 99, 235, 248))
+                };
+                if let Some(path) = rounded_rect_path(lx, ly, bw, bh, 8.0 * sf) {
+                    if let Some(grad) = LinearGradient::new(
+                        Point::from_xy(lx, ly),
+                        Point::from_xy(lx + bw, ly + bh),
+                        vec![GradientStop::new(0.0, c0), GradientStop::new(1.0, c1)],
+                        SpreadMode::Pad,
+                        Transform::identity(),
+                    ) {
+                        let mut paint = Paint::default();
+                        paint.shader = grad;
+                        paint.anti_alias = true;
+                        pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+                    }
+                }
+            } else {
+                let bg = match (btn.action, hovered) {
+                    (ToolbarAction::Cancel, true) => Some(Color::from_rgba8(239, 68, 68, 220)),
+                    (_, true) => Some(hover_bg),
+                    _ => None,
+                };
+                if let Some(c) = bg {
+                    fill_rounded_rect(&mut pm, lx, ly, bw, bh, 8.0 * sf, c);
+                }
+            }
+            let icon_col = if btn.action == ToolbarAction::Copy
+                || (btn.action == ToolbarAction::Cancel && hovered)
+                || self.dark_theme
+            {
+                Color::from_rgba8(248, 250, 252, 255)
+            } else if btn.action == ToolbarAction::Cancel {
+                Color::from_rgba8(100, 116, 139, 255)
+            } else {
+                Color::from_rgba8(30, 41, 59, 255)
+            };
+            draw_toolbar_icon(
+                &mut pm,
+                btn.action,
+                lx + 11.0 * sf,
+                ly + (bh - 14.0 * sf) * 0.5,
+                sf,
+                icon_col,
+            );
+        }
+
+        let rt = self.gpu.as_ref().map(|g| g.rt.clone());
+        if let Some(rt) = rt {
+            if let Some(bmp) = GpuOverlay::upload_widget_bitmap(&rt, &pm, |surf| {
+                for btn in &self.buttons {
+                    let lx = shadow + (btn.rect.left - tb.left);
+                    let ly = shadow + (btn.rect.top - tb.top);
+                    let hovered = self.hovered_button == Some(btn.action);
+                    let txt_color = if btn.action == ToolbarAction::Copy
+                        || (btn.action == ToolbarAction::Cancel && hovered)
+                    {
+                        (255, 255, 255)
+                    } else if self.dark_theme {
+                        if btn.action == ToolbarAction::Cancel {
+                            (203, 213, 225)
+                        } else {
+                            (248, 250, 252)
+                        }
+                    } else if btn.action == ToolbarAction::Cancel {
+                        (100, 116, 139)
+                    } else {
+                        (15, 23, 42)
+                    };
+                    self.draw_text_on_dc(
+                        surf.dc,
+                        btn.label,
+                        RectI::new(lx + s(27), ly, lx + btn.rect.width() - s(6), ly + btn.rect.height()),
+                        txt_color,
+                        dpi,
+                        false,
+                        true,
+                    );
+                }
+            }) {
+                if let Some(g) = self.gpu.as_mut() {
+                    g.toolbar_cache = Some(CachedGpuBitmap {
+                        key,
+                        bmp,
+                        width: full_w,
+                        height: full_h,
+                    });
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_gpu_magnifier(
+        &mut self,
+        cx: i32,
+        cy: i32,
+        dpi: u32,
+        zoom: i32,
+        pad: i32,
+        _info_h: i32,
+        total_w: i32,
+        total_h: i32,
+        shadow: i32,
+    ) {
+        let key = (cx, cy, dpi, self.dark_theme);
+        if self
+            .gpu
+            .as_ref()
+            .and_then(|g| g.magnifier_cache.as_ref())
+            .is_some_and(|c| c.key == key)
+        {
+            return;
+        }
+        let s = |v: i32| scale_dpi(v, dpi);
+        let sf = dpi as f32 / 96.0;
+        let sample_w = 17;
+        let sample_h = 11;
+        let view_w = sample_w * zoom;
+        let view_h = sample_h * zoom;
+        let view_left_off = (total_w - view_w) / 2;
+        let full_w = total_w + shadow * 2;
+        let full_h = total_h + shadow * 2;
+        let Some(mut pm) = Pixmap::new(full_w as u32, full_h as u32) else {
+            return;
+        };
+
+        let (card_bg, card_border, ring_col, hex_col, hint_col) = if self.dark_theme {
+            (
+                Color::from_rgba8(15, 23, 42, 240),
+                Color::from_rgba8(255, 255, 255, 42),
+                Color::from_rgba8(255, 255, 255, 200),
+                (248, 250, 252),
+                (148, 163, 184),
+            )
+        } else {
+            (
+                Color::from_rgba8(255, 255, 255, 248),
+                Color::from_rgba8(15, 23, 42, 34),
+                Color::from_rgba8(100, 116, 139, 200),
+                (15, 23, 42),
+                (100, 116, 139),
+            )
+        };
+        let ox = shadow as f32;
+        let oy = shadow as f32;
+        draw_soft_shadow(&mut pm, ox, oy, total_w as f32, total_h as f32, 12.0 * sf, sf);
+        fill_rounded_rect(&mut pm, ox, oy, total_w as f32, total_h as f32, 12.0 * sf, card_bg);
+        stroke_rounded_rect(
+            &mut pm,
+            ox + 0.5 * sf,
+            oy + 0.5 * sf,
+            total_w as f32 - sf,
+            total_h as f32 - sf,
+            11.5 * sf,
+            1.0 * sf,
+            card_border,
+        );
+
+        let (r, g, b) = self.capture.image.pixel_rgb(cx, cy).unwrap_or((0, 0, 0));
+        let sw_cx = ox + (pad + s(10)) as f32;
+        let sw_cy = oy + (pad + view_h + s(17)) as f32;
+        if let Some(circ) = PathBuilder::from_circle(sw_cx, sw_cy, 7.0 * sf) {
+            let mut paint = Paint::default();
+            paint.set_color(Color::from_rgba8(r, g, b, 255));
+            paint.anti_alias = true;
+            pm.fill_path(&circ, &paint, FillRule::Winding, Transform::identity(), None);
+            let mut ring = Paint::default();
+            ring.set_color(ring_col);
+            ring.anti_alias = true;
+            let st = Stroke {
+                width: 1.2 * sf,
+                ..Stroke::default()
+            };
+            pm.stroke_path(&circ, &ring, &st, Transform::identity(), None);
+        }
+
+        // Paint zoomed pixel grid directly into pm's pixels (super fast!)
+        let half_x = sample_w / 2;
+        let half_y = sample_h / 2;
+        let img_w = self.capture.image.width as i32;
+        let img_h = self.capture.image.height as i32;
+        let vx0 = shadow + view_left_off;
+        let vy0 = shadow + pad;
+        let pm_stride = full_w as usize;
+        {
+            let pm_px = pm.data_mut();
+            for sy_off in 0..sample_h {
+                for sx_off in 0..sample_w {
+                    let px = cx - half_x + sx_off;
+                    let py = cy - half_y + sy_off;
+                    let rgba = if px >= 0 && py >= 0 && px < img_w && py < img_h {
+                        let idx = ((py as u32 * self.capture.image.width + px as u32) * 4) as usize;
+                        let d = &self.capture.image.data;
+                        [d[idx + 2], d[idx + 1], d[idx], 255]
+                    } else {
+                        [34, 24, 20, 255]
+                    };
+                    let dx0 = vx0 + sx_off * zoom;
+                    let dy0 = vy0 + sy_off * zoom;
+                    for yy in dy0..(dy0 + zoom) {
+                        let row = (yy as usize) * pm_stride;
+                        for xx in dx0..(dx0 + zoom) {
+                            let off = (row + xx as usize) * 4;
+                            pm_px[off..off + 4].copy_from_slice(&rgba);
+                        }
+                    }
+                }
+            }
+        }
+        // Crosshair + center pixel box + viewport rim
+        let border_w = s(1).max(1) as f32;
+        let center_x = (vx0 + half_x * zoom) as f32;
+        let center_y = (vy0 + half_y * zoom) as f32;
+        let mut p_cyan = Paint::default();
+        p_cyan.set_color(Color::from_rgba8(56, 189, 248, 255));
+        if let Some(rr) = tiny_skia::Rect::from_xywh(
+            vx0 as f32,
+            center_y + (zoom / 2) as f32,
+            view_w as f32,
+            border_w,
+        ) {
+            pm.fill_rect(rr, &p_cyan, Transform::identity(), None);
+        }
+        if let Some(rr) = tiny_skia::Rect::from_xywh(
+            center_x + (zoom / 2) as f32,
+            vy0 as f32,
+            border_w,
+            view_h as f32,
+        ) {
+            pm.fill_rect(rr, &p_cyan, Transform::identity(), None);
+        }
+        stroke_rounded_rect(
+            &mut pm,
+            center_x - border_w * 0.5,
+            center_y - border_w * 0.5,
+            zoom as f32 + border_w,
+            zoom as f32 + border_w,
+            0.0,
+            border_w,
+            Color::from_rgba8(255, 255, 255, 255),
+        );
+        stroke_rounded_rect(
+            &mut pm,
+            vx0 as f32 + border_w * 0.5,
+            vy0 as f32 + border_w * 0.5,
+            view_w as f32 - border_w,
+            view_h as f32 - border_w,
+            0.0,
+            border_w,
+            Color::from_rgba8(75, 85, 99, 220),
+        );
+
+        let info_top = vy0 + view_h;
+        let hex_line = format!("#{:02X}{:02X}{:02X}  ({},{})", r, g, b, cx, cy);
+        let rt = self.gpu.as_ref().map(|g| g.rt.clone());
+        if let Some(rt) = rt {
+            if let Some(bmp) = GpuOverlay::upload_widget_bitmap(&rt, &pm, |surf| {
+                self.draw_text_on_dc(
+                    surf.dc,
+                    &hex_line,
+                    RectI::new(
+                        shadow + pad + s(24),
+                        info_top + s(6),
+                        shadow + total_w - pad,
+                        info_top + s(28),
+                    ),
+                    hex_col,
+                    dpi,
+                    true,
+                    false,
+                );
+                self.draw_text_on_dc(
+                    surf.dc,
+                    "按 C 复制色值 · 右键重选",
+                    RectI::new(
+                        shadow + pad + s(2),
+                        info_top + s(28),
+                        shadow + total_w - pad,
+                        shadow + total_h - s(6),
+                    ),
+                    hint_col,
+                    dpi,
+                    true,
+                    false,
+                );
+            }) {
+                if let Some(g) = self.gpu.as_mut() {
+                    g.magnifier_cache = Some(CachedGpuBitmap {
+                        key,
+                        bmp,
+                        width: full_w,
+                        height: full_h,
+                    });
+                }
+            }
+        }
+    }
+
     fn render(&mut self) {
         self.layout_toolbar();
+        if !self.ensure_cpu_buffers() {
+            return;
+        }
 
         let width = self.capture.image.width as usize;
         let height = self.capture.image.height as usize;
         let src = &self.capture.image.data;
         let active_rect = self.selection.or(self.hover_rect);
 
-        // 1. Blit full screen dimmed + bright cutout inside active selection/hover rect
+        // 1. Copy pre-computed dimmed backdrop + bright cutout inside active selection/hover rect
         let bounds = self.bounds();
-        {
-            let dst = self.surface.pixels_mut();
-            // Fast dimmed fill (~48% brightness)
-            for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
-                d[0] = ((s[0] as u16 * 124) >> 8) as u8;
-                d[1] = ((s[1] as u16 * 124) >> 8) as u8;
-                d[2] = ((s[2] as u16 * 124) >> 8) as u8;
-                d[3] = 255;
-            }
+        if let (Some(surface), Some(dimmed)) = (self.surface.as_mut(), self.dimmed_bg.as_ref()) {
+            let dst = surface.pixels_mut();
+            dst.copy_from_slice(dimmed);
 
             if let Some(r) = active_rect {
                 let r = r.intersect(bounds);
@@ -536,8 +1649,11 @@ impl OverlayState {
         if r.is_empty() {
             return;
         }
-        let w = self.surface.width as usize;
-        let dst = self.surface.pixels_mut();
+        let Some(surface) = self.surface.as_mut() else {
+            return;
+        };
+        let w = surface.width as usize;
+        let dst = surface.pixels_mut();
         for y in r.top as usize..r.bottom as usize {
             let row = y * w;
             for x in r.left as usize..r.right as usize {
@@ -569,10 +1685,13 @@ impl OverlayState {
     fn composite_pixmap(&mut self, dest_x: i32, dest_y: i32, pixmap: &Pixmap) {
         let pw = pixmap.width() as i32;
         let ph = pixmap.height() as i32;
-        let sw = self.surface.width;
-        let sh = self.surface.height;
+        let Some(surface) = self.surface.as_mut() else {
+            return;
+        };
+        let sw = surface.width;
+        let sh = surface.height;
         let src = pixmap.data(); // premultiplied RGBA
-        let dst = self.surface.pixels_mut();
+        let dst = surface.pixels_mut();
 
         for py in 0..ph {
             let sy = dest_y + py;
@@ -620,31 +1739,10 @@ impl OverlayState {
         small: bool,
         centered: bool,
     ) {
-        let wide = to_wide(text);
-        let mut r = RECT {
-            left: rect.left,
-            top: rect.top,
-            right: rect.right,
-            bottom: rect.bottom,
+        let Some(ref surface) = self.surface else {
+            return;
         };
-        unsafe {
-            let font = self.font_for_dpi(dpi, small);
-            let old = SelectObject(self.surface.dc, windows::Win32::Graphics::Gdi::HGDIOBJ(font.0));
-            SetBkMode(self.surface.dc, TRANSPARENT);
-            SetTextColor(self.surface.dc, rgb_colorref(color.0, color.1, color.2));
-            let flags = if centered {
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP
-            } else {
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP
-            };
-            let _ = DrawTextW(
-                self.surface.dc,
-                &mut wide[..wide.len() - 1].to_vec(),
-                &mut r,
-                flags,
-            );
-            let _ = SelectObject(self.surface.dc, old);
-        }
+        self.draw_text_on_dc(surface.dc, text, rect, color, dpi, small, centered);
     }
 
     fn draw_top_hint_pill(&mut self) {
@@ -661,21 +1759,26 @@ impl OverlayState {
         let px = mon.left + (mon.width() - pill_w) / 2;
         let py = mon.top + s(18);
 
+        let (bg, border, txt_col) = if self.dark_theme {
+            (
+                Color::from_rgba8(15, 23, 42, 226),
+                Color::from_rgba8(255, 255, 255, 36),
+                (226, 232, 240),
+            )
+        } else {
+            (
+                Color::from_rgba8(255, 255, 255, 242),
+                Color::from_rgba8(15, 23, 42, 34),
+                (15, 23, 42),
+            )
+        };
         if let Some(mut pm) =
             Pixmap::new((pill_w + shadow * 2) as u32, (pill_h + shadow * 2) as u32)
         {
             let ox = shadow as f32;
             let oy = shadow as f32;
             draw_soft_shadow(&mut pm, ox, oy, pill_w as f32, pill_h as f32, 15.0 * sf, sf);
-            fill_rounded_rect(
-                &mut pm,
-                ox,
-                oy,
-                pill_w as f32,
-                pill_h as f32,
-                15.0 * sf,
-                Color::from_rgba8(15, 23, 42, 226),
-            );
+            fill_rounded_rect(&mut pm, ox, oy, pill_w as f32, pill_h as f32, 15.0 * sf, bg);
             stroke_rounded_rect(
                 &mut pm,
                 ox + 0.5 * sf,
@@ -684,14 +1787,14 @@ impl OverlayState {
                 pill_h as f32 - sf,
                 14.5 * sf,
                 1.0 * sf,
-                Color::from_rgba8(255, 255, 255, 36),
+                border,
             );
             self.composite_pixmap(px - shadow, py - shadow, &pm);
         }
         self.draw_text_on_surface(
             text,
             RectI::new(px, py, px + pill_w, py + pill_h),
-            (226, 232, 240),
+            txt_col,
             dpi,
             true,
             true,
@@ -720,21 +1823,28 @@ impl OverlayState {
             sel.top + gap
         };
 
+        let (bg, border, dot_col, txt_col) = if self.dark_theme {
+            (
+                Color::from_rgba8(15, 23, 42, 234),
+                Color::from_rgba8(255, 255, 255, 36),
+                Color::from_rgba8(56, 189, 248, 255),
+                (248, 250, 252),
+            )
+        } else {
+            (
+                Color::from_rgba8(255, 255, 255, 246),
+                Color::from_rgba8(15, 23, 42, 34),
+                Color::from_rgba8(2, 132, 199, 255),
+                (15, 23, 42),
+            )
+        };
         if let Some(mut pm) =
             Pixmap::new((badge_w + shadow * 2) as u32, (badge_h + shadow * 2) as u32)
         {
             let ox = shadow as f32;
             let oy = shadow as f32;
             draw_soft_shadow(&mut pm, ox, oy, badge_w as f32, badge_h as f32, 8.0 * sf, sf);
-            fill_rounded_rect(
-                &mut pm,
-                ox,
-                oy,
-                badge_w as f32,
-                badge_h as f32,
-                8.0 * sf,
-                Color::from_rgba8(15, 23, 42, 234),
-            );
+            fill_rounded_rect(&mut pm, ox, oy, badge_w as f32, badge_h as f32, 8.0 * sf, bg);
             stroke_rounded_rect(
                 &mut pm,
                 ox + 0.5 * sf,
@@ -743,16 +1853,15 @@ impl OverlayState {
                 badge_h as f32 - sf,
                 7.5 * sf,
                 1.0 * sf,
-                Color::from_rgba8(255, 255, 255, 36),
+                border,
             );
-            // Tiny glowing sky-cyan status dot on left of dimensions
             if let Some(dot) = PathBuilder::from_circle(
                 ox + 11.0 * sf,
                 oy + (badge_h as f32) * 0.5,
                 3.0 * sf,
             ) {
                 let mut paint = Paint::default();
-                paint.set_color(Color::from_rgba8(56, 189, 248, 255));
+                paint.set_color(dot_col);
                 paint.anti_alias = true;
                 pm.fill_path(&dot, &paint, FillRule::Winding, Transform::identity(), None);
             }
@@ -761,7 +1870,7 @@ impl OverlayState {
         self.draw_text_on_surface(
             &text,
             RectI::new(bx + s(16), by, bx + badge_w - s(6), by + badge_h),
-            (248, 250, 252),
+            txt_col,
             dpi,
             true,
             true,
@@ -789,16 +1898,23 @@ impl OverlayState {
         // Soft multi-layer elevation shadow
         draw_soft_shadow(&mut pm, ox, oy, tw as f32, th as f32, 12.0 * sf, sf);
 
-        // Dark frosted glass dock surface
-        fill_rounded_rect(
-            &mut pm,
-            ox,
-            oy,
-            tw as f32,
-            th as f32,
-            12.0 * sf,
-            Color::from_rgba8(15, 23, 42, 240),
-        );
+        // Frosted glass dock surface (Light or Dark theme)
+        let (dock_bg, dock_border, div_col, hover_bg) = if self.dark_theme {
+            (
+                Color::from_rgba8(15, 23, 42, 240),
+                Color::from_rgba8(255, 255, 255, 38),
+                Color::from_rgba8(255, 255, 255, 32),
+                Color::from_rgba8(255, 255, 255, 30),
+            )
+        } else {
+            (
+                Color::from_rgba8(255, 255, 255, 248),
+                Color::from_rgba8(15, 23, 42, 34),
+                Color::from_rgba8(15, 23, 42, 26),
+                Color::from_rgba8(15, 23, 42, 16),
+            )
+        };
+        fill_rounded_rect(&mut pm, ox, oy, tw as f32, th as f32, 12.0 * sf, dock_bg);
         stroke_rounded_rect(
             &mut pm,
             ox + 0.5 * sf,
@@ -807,7 +1923,7 @@ impl OverlayState {
             th as f32 - sf,
             11.5 * sf,
             1.0 * sf,
-            Color::from_rgba8(255, 255, 255, 38),
+            dock_border,
         );
 
         // Subtle divider before Cancel button
@@ -820,7 +1936,7 @@ impl OverlayState {
                 (1.0 * sf).max(1.0),
                 th as f32 - 20.0 * sf,
                 0.5 * sf,
-                Color::from_rgba8(255, 255, 255, 32),
+                div_col,
             );
         }
 
@@ -832,7 +1948,6 @@ impl OverlayState {
             let hovered = self.hovered_button == Some(btn.action);
 
             if btn.action == ToolbarAction::Copy {
-                // Vibrant sky->blue gradient primary action pill
                 let (c0, c1) = if hovered {
                     (
                         Color::from_rgba8(56, 189, 248, 255),
@@ -840,8 +1955,8 @@ impl OverlayState {
                     )
                 } else {
                     (
-                        Color::from_rgba8(14, 165, 233, 240),
-                        Color::from_rgba8(37, 99, 235, 240),
+                        Color::from_rgba8(14, 165, 233, 248),
+                        Color::from_rgba8(37, 99, 235, 248),
                     )
                 };
                 if let Some(path) = rounded_rect_path(lx, ly, bw, bh, 8.0 * sf) {
@@ -860,8 +1975,8 @@ impl OverlayState {
                 }
             } else {
                 let bg = match (btn.action, hovered) {
-                    (ToolbarAction::Cancel, true) => Some(Color::from_rgba8(239, 68, 68, 195)),
-                    (_, true) => Some(Color::from_rgba8(255, 255, 255, 30)),
+                    (ToolbarAction::Cancel, true) => Some(Color::from_rgba8(239, 68, 68, 220)),
+                    (_, true) => Some(hover_bg),
                     _ => None,
                 };
                 if let Some(c) = bg {
@@ -869,9 +1984,19 @@ impl OverlayState {
                 }
             }
 
+            let icon_col = if btn.action == ToolbarAction::Copy
+                || (btn.action == ToolbarAction::Cancel && hovered)
+                || self.dark_theme
+            {
+                Color::from_rgba8(248, 250, 252, 255)
+            } else if btn.action == ToolbarAction::Cancel {
+                Color::from_rgba8(100, 116, 139, 255)
+            } else {
+                Color::from_rgba8(30, 41, 59, 255)
+            };
             let ix = lx + 11.0 * sf;
             let iy = ly + (bh - 14.0 * sf) * 0.5;
-            draw_toolbar_icon(&mut pm, btn.action, ix, iy, sf);
+            draw_toolbar_icon(&mut pm, btn.action, ix, iy, sf, icon_col);
         }
 
         self.composite_pixmap(tb.left - shadow, tb.top - shadow, &pm);
@@ -884,10 +2009,21 @@ impl OverlayState {
                 btn.rect.right - s(6),
                 btn.rect.bottom,
             );
-            let txt_color = if btn.action == ToolbarAction::Cancel && self.hovered_button != Some(ToolbarAction::Cancel) {
-                (203, 213, 225)
+            let hovered = self.hovered_button == Some(btn.action);
+            let txt_color = if btn.action == ToolbarAction::Copy
+                || (btn.action == ToolbarAction::Cancel && hovered)
+            {
+                (255, 255, 255)
+            } else if self.dark_theme {
+                if btn.action == ToolbarAction::Cancel {
+                    (203, 213, 225)
+                } else {
+                    (248, 250, 252)
+                }
+            } else if btn.action == ToolbarAction::Cancel {
+                (100, 116, 139)
             } else {
-                (248, 250, 252)
+                (15, 23, 42)
             };
             self.draw_text_on_surface(btn.label, text_rect, txt_color, dpi, false, true);
         }
@@ -926,22 +2062,31 @@ impl OverlayState {
         mx = mx.clamp(mon.left + s(6), (mon.right - total_w - s(6)).max(mon.left + s(6)));
         my = my.clamp(mon.top + s(6), (mon.bottom - total_h - s(6)).max(mon.top + s(6)));
 
-        // Rounded floating card with soft shadow
+        // Rounded floating card with soft shadow (Light or Dark)
+        let (card_bg, card_border, ring_col, hex_col, hint_col) = if self.dark_theme {
+            (
+                Color::from_rgba8(15, 23, 42, 240),
+                Color::from_rgba8(255, 255, 255, 42),
+                Color::from_rgba8(255, 255, 255, 200),
+                (248, 250, 252),
+                (148, 163, 184),
+            )
+        } else {
+            (
+                Color::from_rgba8(255, 255, 255, 248),
+                Color::from_rgba8(15, 23, 42, 34),
+                Color::from_rgba8(100, 116, 139, 200),
+                (15, 23, 42),
+                (100, 116, 139),
+            )
+        };
         if let Some(mut pm) =
             Pixmap::new((total_w + shadow * 2) as u32, (total_h + shadow * 2) as u32)
         {
             let ox = shadow as f32;
             let oy = shadow as f32;
             draw_soft_shadow(&mut pm, ox, oy, total_w as f32, total_h as f32, 12.0 * sf, sf);
-            fill_rounded_rect(
-                &mut pm,
-                ox,
-                oy,
-                total_w as f32,
-                total_h as f32,
-                12.0 * sf,
-                Color::from_rgba8(15, 23, 42, 240),
-            );
+            fill_rounded_rect(&mut pm, ox, oy, total_w as f32, total_h as f32, 12.0 * sf, card_bg);
             stroke_rounded_rect(
                 &mut pm,
                 ox + 0.5 * sf,
@@ -950,7 +2095,7 @@ impl OverlayState {
                 total_h as f32 - sf,
                 11.5 * sf,
                 1.0 * sf,
-                Color::from_rgba8(255, 255, 255, 42),
+                card_border,
             );
 
             // Circular color swatch in footer
@@ -964,7 +2109,7 @@ impl OverlayState {
                 paint.anti_alias = true;
                 pm.fill_path(&circ, &paint, FillRule::Winding, Transform::identity(), None);
                 let mut ring = Paint::default();
-                ring.set_color(Color::from_rgba8(255, 255, 255, 200));
+                ring.set_color(ring_col);
                 ring.anti_alias = true;
                 let st = Stroke {
                     width: 1.2 * sf,
@@ -1039,7 +2184,7 @@ impl OverlayState {
                 mx + total_w - pad,
                 info_top + s(28),
             ),
-            (248, 250, 252),
+            hex_col,
             dpi,
             true,
             false,
@@ -1052,7 +2197,7 @@ impl OverlayState {
                 mx + total_w - pad,
                 my + total_h - s(6),
             ),
-            (148, 163, 184),
+            hint_col,
             dpi,
             true,
             false,
@@ -1112,9 +2257,11 @@ impl OverlayState {
     }
 
     fn request_repaint(&mut self) {
-        self.render();
-        unsafe {
-            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        self.dirty = true;
+        if !self.hwnd.is_invalid() {
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+            }
         }
     }
 }
@@ -1219,9 +2366,16 @@ fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia
     pb.finish()
 }
 
-fn draw_toolbar_icon(pm: &mut Pixmap, action: ToolbarAction, x: f32, y: f32, scale: f32) {
+fn draw_toolbar_icon(
+    pm: &mut Pixmap,
+    action: ToolbarAction,
+    x: f32,
+    y: f32,
+    scale: f32,
+    color: Color,
+) {
     let mut paint = Paint::default();
-    paint.set_color(Color::from_rgba8(248, 250, 252, 255));
+    paint.set_color(color);
     paint.anti_alias = true;
     let stroke = Stroke {
         width: 1.7,
@@ -1298,20 +2452,10 @@ unsafe extern "system" fn overlay_wnd_proc(
             let mut ps = PAINTSTRUCT::default();
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
             ACTIVE_OVERLAY.with(|cell| {
-                if let Some(s) = cell.borrow().as_ref() {
-                    let _ = unsafe {
-                        BitBlt(
-                            hdc,
-                            0,
-                            0,
-                            s.surface.width,
-                            s.surface.height,
-                            Some(s.surface.dc),
-                            0,
-                            0,
-                            SRCCOPY,
-                        )
-                    };
+                if let Some(s) = cell.borrow_mut().as_mut() {
+                    if !s.render_gpu() {
+                        s.render_cpu_and_blit(hdc, ps.rcPaint);
+                    }
                 }
             });
             unsafe {
@@ -1738,10 +2882,14 @@ mod visual_tests {
         let mut state = OverlayState {
             hwnd: HWND::default(),
             capture,
-            surface,
+            gpu: None,
+            surface: Some(surface),
+            dimmed_bg: None,
             fonts,
             show_magnifier: true,
             smart_window_detect: true,
+            dark_theme: false,
+            dirty: true,
             selection: Some(RectI::new(380, 220, 1280, 740)),
             hover_rect: None,
             drag_mode: DragMode::None,
@@ -1756,12 +2904,12 @@ mod visual_tests {
             finished: false,
         };
         state.render();
-        let mut pix1 = state.surface.pixels_mut().to_vec();
+        let mut pix1 = state.surface.as_mut().unwrap().pixels_mut().to_vec();
         for px in pix1.chunks_exact_mut(4) {
             px[3] = 255;
         }
         let out = BgraImage::from_bgra(w, h, pix1).unwrap();
-        out.save_to_file(&out_dir.join("overlay-selected.png"), SaveFormat::Png)
+        out.save_to_file(&out_dir.join("overlay-light-selected.png"), SaveFormat::Png)
             .unwrap();
 
         // Also render hover / pre-selection state with L-corner viewfinder + top hint pill + magnifier!
@@ -1769,12 +2917,103 @@ mod visual_tests {
         state.hover_rect = Some(RectI::new(340, 270, 1180, 740));
         state.cursor_pos = (880, 460);
         state.render();
-        let mut pix2 = state.surface.pixels_mut().to_vec();
+        let mut pix2 = state.surface.as_mut().unwrap().pixels_mut().to_vec();
         for px in pix2.chunks_exact_mut(4) {
             px[3] = 255;
         }
         let out2 = BgraImage::from_bgra(w, h, pix2).unwrap();
-        out2.save_to_file(&out_dir.join("overlay-hover.png"), SaveFormat::Png)
+        out2.save_to_file(&out_dir.join("overlay-light-hover.png"), SaveFormat::Png)
             .unwrap();
+    }
+
+    #[test]
+    fn gpu_overlay_initializes_and_renders_fast() {
+        ensure_class_registered();
+        let class_w = to_wide(OVERLAY_CLASS);
+        let w = 3840u32;
+        let h = 2160u32;
+        let Ok(hwnd) = (unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                PCWSTR(class_w.as_ptr()),
+                PCWSTR::null(),
+                WS_POPUP,
+                0,
+                0,
+                w as i32,
+                h as i32,
+                None,
+                None,
+                Some(current_hinstance()),
+                None,
+            )
+        }) else {
+            return;
+        };
+
+        let img = BgraImage::new_solid(w, h, 240, 244, 248, 255);
+        let gpu = GpuOverlay::new(hwnd, &img);
+        assert!(gpu.is_some(), "Direct2D GPU overlay should initialize on Windows desktop");
+
+        let mut fonts = HashMap::new();
+        for d in [216u32, 96u32] {
+            fonts.insert(
+                d,
+                (
+                    OwnedFont(create_ui_font(d, 10, false)),
+                    OwnedFont(create_ui_font(d, 9, false)),
+                ),
+            );
+        }
+        let mut state = OverlayState {
+            hwnd,
+            capture: ScreenCapture {
+                image: img,
+                origin_x: 0,
+                origin_y: 0,
+                monitors: vec![MonitorInfo {
+                    rect: RectI::new(0, 0, w as i32, h as i32),
+                    dpi: 216,
+                }],
+                window_rects: Vec::new(),
+            },
+            gpu,
+            surface: None,
+            dimmed_bg: None,
+            fonts,
+            show_magnifier: true,
+            smart_window_detect: true,
+            dark_theme: false,
+            dirty: true,
+            selection: Some(RectI::new(400, 300, 1400, 900)),
+            hover_rect: None,
+            drag_mode: DragMode::Creating,
+            drag_start: (400, 300),
+            drag_orig_sel: RectI::default(),
+            cursor_pos: (1400, 900),
+            toolbar_rect: RectI::default(),
+            toolbar_dpi: 216,
+            buttons: Vec::new(),
+            hovered_button: None,
+            on_finish: None,
+            finished: false,
+        };
+
+        // Warmup 1 frame, then benchmark 20 consecutive drag frames at 4K (3840x2160)
+        assert!(state.render_gpu());
+        let t0 = std::time::Instant::now();
+        for i in 0..20 {
+            state.selection = Some(RectI::new(400, 300, 1400 + i * 20, 900 + i * 12));
+            state.cursor_pos = (1400 + i * 20, 900 + i * 12);
+            assert!(state.render_gpu());
+        }
+        let avg_ms = t0.elapsed().as_secs_f64() * 1000.0 / 20.0;
+        println!("Direct2D GPU overlay 4K drag avg: {avg_ms:.2} ms/frame ({:.0} FPS)", 1000.0 / avg_ms.max(0.01));
+        assert!(state.surface.is_none(), "GPU path must not allocate 32-88MB CPU fallback DIB");
+
+        drop(state);
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
     }
 }

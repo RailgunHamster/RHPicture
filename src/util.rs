@@ -22,8 +22,8 @@ use windows::Win32::System::ProcessStatus::{
 };
 #[cfg(windows)]
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_SZ, RegCloseKey, RegDeleteValueW,
-    RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_SZ, REG_VALUE_TYPE, RegCloseKey,
+    RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
 #[cfg(windows)]
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -327,6 +327,46 @@ pub fn get_auto_start() -> bool {
         let _ = RegCloseKey(hkey);
         exists
     }
+}
+
+/// Detect whether Windows currently uses dark mode for apps (`AppsUseLightTheme == 0`).
+#[cfg(windows)]
+pub fn system_prefers_dark_mode() -> bool {
+    let subkey = to_wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+    let val_name = to_wide("AppsUseLightTheme");
+    unsafe {
+        let mut hkey = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            Some(0),
+            KEY_READ,
+            &mut hkey,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        let mut data: u32 = 1;
+        let mut data_len = std::mem::size_of::<u32>() as u32;
+        let mut reg_type = REG_VALUE_TYPE::default();
+        let ok = RegQueryValueExW(
+            hkey,
+            PCWSTR(val_name.as_ptr()),
+            None,
+            Some(&mut reg_type),
+            Some(&mut data as *mut u32 as *mut u8),
+            Some(&mut data_len),
+        )
+        .is_ok();
+        let _ = RegCloseKey(hkey);
+        ok && reg_type == REG_DWORD && data == 0
+    }
+}
+
+#[cfg(not(windows))]
+pub fn system_prefers_dark_mode() -> bool {
+    false
 }
 
 #[cfg(windows)]

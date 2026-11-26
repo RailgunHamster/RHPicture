@@ -6,8 +6,9 @@ use crate::hotkey::{
 use crate::image_ops::{BgraImage, clipboard};
 use crate::overlay::{OverlayOutcome, start_screenshot_overlay};
 use crate::pin;
+use crate::popup_menu::{MenuEntry, MenuIcon, show_popup_menu};
 use crate::settings_ui::{self, SettingsCallbacks};
-use crate::updater::UpdateService;
+use crate::updater::{APP_VERSION, UpdateService};
 use crate::util::{
     current_hinstance, load_app_icon, save_file_dialog, timestamp_filename, to_wide,
     trim_working_set,
@@ -20,13 +21,10 @@ use windows::Win32::UI::Shell::{
     NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, MF_GRAYED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, SM_CXSCREEN, SM_CYSCREEN, SetForegroundWindow, SetMenuDefaultItem,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WM_APP,
-    WM_DESTROY, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW,
-    WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
+    GetSystemMetrics, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    RegisterWindowMessageW, SM_CXSCREEN, SM_CYSCREEN, TranslateMessage, WM_APP, WM_DESTROY,
+    WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::PCWSTR;
 
@@ -162,22 +160,23 @@ fn handle_save_image(owner: HWND, cfg: &AppConfig, img: &BgraImage) {
 }
 
 fn trigger_screenshot() {
-    let (hwnd, smart, mag) = APP.with(|cell| {
+    let (hwnd, smart, mag, dark_theme) = APP.with(|cell| {
         let borrow = cell.borrow();
         let Some(app) = borrow.as_ref() else {
-            return (HWND::default(), true, true);
+            return (HWND::default(), true, true, false);
         };
         (
             app.hwnd,
             app.config.smart_window_detect,
             app.config.show_magnifier,
+            app.config.theme.is_dark(),
         )
     });
     if hwnd.is_invalid() {
         return;
     }
 
-    if let Err(err) = start_screenshot_overlay(smart, mag, move |outcome| match outcome {
+    if let Err(err) = start_screenshot_overlay(smart, mag, dark_theme, move |outcome| match outcome {
         OverlayOutcome::Copy(img) => {
             if let Err(e) = clipboard::copy_image(&img) {
                 show_balloon(hwnd, "复制失败", &e, true);
@@ -296,97 +295,123 @@ fn show_tray_menu(hwnd: HWND) {
     let hidden_pins: Vec<_> = pins.iter().filter(|p| p.hidden).cloned().collect();
     let has_click_through = pins.iter().any(|p| p.click_through);
 
-    let cmd = unsafe {
-        let Ok(menu) = CreatePopupMenu() else {
-            return;
-        };
-        let add = |hmenu, id: u32, text: &str, disabled: bool| {
-            let w = to_wide(text);
-            let flags = if disabled {
-                MF_STRING | MF_GRAYED
-            } else {
-                MF_STRING
-            };
-            let _ = AppendMenuW(hmenu, flags, id as usize, PCWSTR(w.as_ptr()));
-        };
+    let mut entries = vec![
+        MenuEntry::Header {
+            title: "RHPicture".into(),
+            subtitle: format!("v{APP_VERSION} · 极简截图贴图"),
+        },
+        MenuEntry::Separator,
+        MenuEntry::Action {
+            id: MENU_SCREENSHOT,
+            icon: MenuIcon::Crop,
+            label: "开始截图".into(),
+            shortcut: cfg.screenshot_hotkey.clone(),
+            enabled: true,
+            checked: false,
+            danger: false,
+        },
+        MenuEntry::Action {
+            id: MENU_PIN_CLIPBOARD,
+            icon: MenuIcon::Pin,
+            label: "贴图剪贴板图像".into(),
+            shortcut: cfg.pin_clipboard_hotkey.clone(),
+            enabled: true,
+            checked: false,
+            danger: false,
+        },
+        MenuEntry::Separator,
+    ];
 
-        let shot_label = if cfg.screenshot_hotkey.is_empty() {
-            "开始截图".to_string()
-        } else {
-            format!("开始截图\t{}", cfg.screenshot_hotkey)
-        };
-        let pin_label = if cfg.pin_clipboard_hotkey.is_empty() {
-            "贴图剪贴板图像".to_string()
-        } else {
-            format!("贴图剪贴板图像\t{}", cfg.pin_clipboard_hotkey)
-        };
-
-        add(menu, MENU_SCREENSHOT, &shot_label, false);
-        add(menu, MENU_PIN_CLIPBOARD, &pin_label, false);
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-
-        if visible_count > 0 {
-            add(
-                menu,
-                MENU_HIDE_ALL_PINS,
-                &format!("隐藏全部贴图（{visible_count}）"),
-                false,
-            );
+    if visible_count > 0 {
+        entries.push(MenuEntry::Action {
+            id: MENU_HIDE_ALL_PINS,
+            icon: MenuIcon::EyeOff,
+            label: format!("隐藏全部贴图（{visible_count}）"),
+            shortcut: String::new(),
+            enabled: true,
+            checked: false,
+            danger: false,
+        });
+    }
+    if !hidden_pins.is_empty() {
+        entries.push(MenuEntry::Action {
+            id: MENU_SHOW_ALL_PINS,
+            icon: MenuIcon::Eye,
+            label: format!("显示全部已隐藏贴图（{}）", hidden_pins.len()),
+            shortcut: String::new(),
+            enabled: true,
+            checked: false,
+            danger: false,
+        });
+        // Show up to 5 individual hidden pins inline for 1-click restore
+        for (idx, p) in hidden_pins.iter().take(5).enumerate() {
+            entries.push(MenuEntry::Action {
+                id: MENU_RESTORE_PIN_BASE + idx as u32,
+                icon: MenuIcon::Pin,
+                label: format!("恢复贴图 #{}（{}×{}）", p.id, p.width, p.height),
+                shortcut: String::new(),
+                enabled: true,
+                checked: false,
+                danger: false,
+            });
         }
-        if !hidden_pins.is_empty() {
-            add(
-                menu,
-                MENU_SHOW_ALL_PINS,
-                &format!("显示全部已隐藏贴图（{}）", hidden_pins.len()),
-                false,
-            );
-            if let Ok(sub) = CreatePopupMenu() {
-                for (idx, p) in hidden_pins.iter().enumerate() {
-                    let label = format!("贴图 #{}（{} × {}）", p.id, p.width, p.height);
-                    add(sub, MENU_RESTORE_PIN_BASE + idx as u32, &label, false);
-                }
-                let sub_title = to_wide("恢复单个隐藏贴图");
-                let _ = AppendMenuW(
-                    menu,
-                    MF_POPUP,
-                    sub.0 as usize,
-                    PCWSTR(sub_title.as_ptr()),
-                );
-            }
-        }
-        if has_click_through {
-            add(menu, MENU_DISABLE_CLICKTHROUGH, "取消全部鼠标穿透", false);
-        }
-        add(
-            menu,
-            MENU_CLOSE_ALL_PINS,
-            &format!("关闭全部贴图（{}）", pins.len()),
-            pins.is_empty(),
-        );
+    }
+    if has_click_through {
+        entries.push(MenuEntry::Action {
+            id: MENU_DISABLE_CLICKTHROUGH,
+            icon: MenuIcon::Pointer,
+            label: "取消全部鼠标穿透".into(),
+            shortcut: String::new(),
+            enabled: true,
+            checked: false,
+            danger: false,
+        });
+    }
+    entries.push(MenuEntry::Action {
+        id: MENU_CLOSE_ALL_PINS,
+        icon: MenuIcon::Close,
+        label: format!("关闭全部贴图（{}）", pins.len()),
+        shortcut: String::new(),
+        enabled: !pins.is_empty(),
+        checked: false,
+        danger: !pins.is_empty(),
+    });
+    entries.push(MenuEntry::Separator);
+    entries.push(MenuEntry::Action {
+        id: MENU_SETTINGS,
+        icon: MenuIcon::Settings,
+        label: "设置与快捷键…".into(),
+        shortcut: String::new(),
+        enabled: true,
+        checked: false,
+        danger: false,
+    });
+    entries.push(MenuEntry::Action {
+        id: MENU_CHECK_UPDATE,
+        icon: MenuIcon::Update,
+        label: "检查更新…".into(),
+        shortcut: String::new(),
+        enabled: true,
+        checked: false,
+        danger: false,
+    });
+    entries.push(MenuEntry::Separator);
+    entries.push(MenuEntry::Action {
+        id: MENU_EXIT,
+        icon: MenuIcon::Power,
+        label: "退出 RHPicture".into(),
+        shortcut: String::new(),
+        enabled: true,
+        checked: false,
+        danger: true,
+    });
 
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        add(menu, MENU_SETTINGS, "设置与快捷键…", false);
-        add(menu, MENU_CHECK_UPDATE, "检查更新…", false);
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-        add(menu, MENU_EXIT, "退出 RHPicture", false);
-
-        let _ = SetMenuDefaultItem(menu, MENU_SETTINGS, 0);
-
-        let mut pt = POINT::default();
+    let mut pt = POINT::default();
+    unsafe {
         let _ = GetCursorPos(&mut pt);
-        let _ = SetForegroundWindow(hwnd);
-        let chosen = TrackPopupMenu(
-            menu,
-            TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RETURNCMD,
-            pt.x,
-            pt.y,
-            Some(0),
-            hwnd,
-            None,
-        )
-        .0 as u32;
-        let _ = DestroyMenu(menu);
-        chosen
+    }
+    let Some(cmd) = show_popup_menu(hwnd, pt.x, pt.y, entries, cfg.theme.is_dark()) else {
+        return;
     };
 
     match cmd {

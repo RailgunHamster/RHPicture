@@ -3,7 +3,9 @@
 //! native Win32 EDIT controls embedded cleanly inside rounded input frames.
 
 use crate::capture::RectI;
-use crate::config::{AppConfig, PinDoubleClickAction, ProxyConfig, SaveFormat, UpdateProvider};
+use crate::config::{
+    AppConfig, PinDoubleClickAction, ProxyConfig, SaveFormat, ThemeMode, UpdateProvider,
+};
 use crate::hotkey::{HotkeySpec, MOD_FLAG_ALT, MOD_FLAG_CTRL, MOD_FLAG_SHIFT, MOD_FLAG_WIN};
 use crate::pin;
 use crate::update_splash::draw_rhpicture_emblem;
@@ -14,7 +16,6 @@ use crate::util::{
     set_auto_start, to_wide, window_dpi,
 };
 use std::cell::{Cell, RefCell};
-use std::os::windows::process::CommandExt;
 use std::sync::{Arc, Once};
 use tiny_skia::{
     Color, FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Paint, PathBuilder, Pixmap,
@@ -44,7 +45,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, SetWindowTextW, ShowWindow, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT,
     WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFONT, WM_SYSKEYDOWN, WM_TIMER,
-    WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
+    WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    WS_TABSTOP,
 };
 use windows::core::PCWSTR;
 
@@ -69,6 +71,7 @@ enum HitKind {
     NavTab(usize),
     HotkeyRecord(usize),
     HotkeyClear(usize),
+    ThemeSeg(usize),
     ToggleAutoStart,
     ToggleSmartWin,
     ToggleMagnifier,
@@ -83,7 +86,6 @@ enum HitKind {
     UpdatePrimary,
     UpdateRecheck,
     UpdateCancel,
-    UpdatePreviewSplash,
     UpdateSourceSeg(usize),
     ToggleAutoCheck,
     ToggleProxy,
@@ -140,10 +142,243 @@ struct SettingsWindow {
     font_body_bold: OwnedFont,
     font_small: OwnedFont,
     font_input: OwnedFont,
-    edit_bg_brush: OwnedBrush,
+    edit_bg_light: OwnedBrush,
+    edit_bg_dark: OwnedBrush,
 
     updater: UpdateService,
     callbacks: SettingsCallbacks,
+}
+
+#[derive(Clone, Copy)]
+struct Palette {
+    dark: bool,
+    dwm_caption: (u8, u8, u8),
+    dwm_text: (u8, u8, u8),
+    sidebar_bg: Color,
+    canvas_bg: Color,
+    hairline: Color,
+    card_bg: Color,
+    card_sub_bg: Color,
+    card_border: Color,
+    divider: Color,
+    row_hover: Color,
+    nav_active_bg: Color,
+    nav_active_bar: Color,
+    nav_hover_bg: Color,
+    nav_icon_active: Color,
+    nav_icon_idle: Color,
+    nav_txt_active: (u8, u8, u8),
+    nav_txt_hover: (u8, u8, u8),
+    nav_txt_idle: (u8, u8, u8),
+    text_primary: (u8, u8, u8),
+    text_body: (u8, u8, u8),
+    text_secondary: (u8, u8, u8),
+    text_muted: (u8, u8, u8),
+    text_accent: (u8, u8, u8),
+    text_success: (u8, u8, u8),
+    text_warning: (u8, u8, u8),
+    text_danger: (u8, u8, u8),
+    text_danger_soft: (u8, u8, u8),
+    input_bg: Color,
+    input_bg_rgb: (u8, u8, u8),
+    input_text_rgb: (u8, u8, u8),
+    input_border: Color,
+    input_border_focus: Color,
+    keycap_bg: Color,
+    keycap_hover_bg: Color,
+    keycap_rec_bg: Color,
+    keycap_border: Color,
+    keycap_hover_border: Color,
+    toggle_off_track: Color,
+    toggle_off_border: Color,
+    seg_bg: Color,
+    seg_border: Color,
+    seg_active_bg: Color,
+    seg_hover_bg: Color,
+    ghost_bg: Color,
+    ghost_hover_bg: Color,
+    ghost_border: Color,
+    ghost_hover_border: Color,
+    ghost_danger_bg: Color,
+    ghost_danger_hover_bg: Color,
+    ghost_danger_border: Color,
+    ghost_danger_hover_border: Color,
+    progress_track: Color,
+    toast_muted_bg: Color,
+    toast_muted_border: Color,
+    badge_ok_bg: Color,
+    badge_warn_bg: Color,
+    badge_err_bg: Color,
+}
+
+impl Palette {
+    fn for_dark(dark: bool) -> Self {
+        if dark {
+            Self::dark()
+        } else {
+            Self::light()
+        }
+    }
+
+    fn light() -> Self {
+        Self {
+            dark: false,
+            dwm_caption: (241, 245, 249),
+            dwm_text: (15, 23, 42),
+            sidebar_bg: Color::from_rgba8(241, 245, 249, 255),
+            canvas_bg: Color::from_rgba8(248, 250, 252, 255),
+            hairline: Color::from_rgba8(15, 23, 42, 22),
+            card_bg: Color::from_rgba8(255, 255, 255, 255),
+            card_sub_bg: Color::from_rgba8(255, 255, 255, 255),
+            card_border: Color::from_rgba8(15, 23, 42, 24),
+            divider: Color::from_rgba8(15, 23, 42, 16),
+            row_hover: Color::from_rgba8(15, 23, 42, 8),
+            nav_active_bg: Color::from_rgba8(14, 165, 233, 28),
+            nav_active_bar: Color::from_rgba8(2, 132, 199, 255),
+            nav_hover_bg: Color::from_rgba8(15, 23, 42, 10),
+            nav_icon_active: Color::from_rgba8(2, 132, 199, 255),
+            nav_icon_idle: Color::from_rgba8(100, 116, 139, 255),
+            nav_txt_active: (3, 105, 161),
+            nav_txt_hover: (15, 23, 42),
+            nav_txt_idle: (71, 85, 105),
+            text_primary: (15, 23, 42),
+            text_body: (51, 65, 85),
+            text_secondary: (100, 116, 139),
+            text_muted: (100, 116, 139),
+            text_accent: (2, 132, 199),
+            text_success: (5, 150, 105),
+            text_warning: (180, 83, 9),
+            text_danger: (225, 29, 72),
+            text_danger_soft: (190, 18, 60),
+            input_bg: Color::from_rgba8(248, 250, 252, 255),
+            input_bg_rgb: (248, 250, 252),
+            input_text_rgb: (15, 23, 42),
+            input_border: Color::from_rgba8(203, 213, 225, 255),
+            input_border_focus: Color::from_rgba8(2, 132, 199, 255),
+            keycap_bg: Color::from_rgba8(248, 250, 252, 255),
+            keycap_hover_bg: Color::from_rgba8(241, 245, 249, 255),
+            keycap_rec_bg: Color::from_rgba8(224, 242, 254, 255),
+            keycap_border: Color::from_rgba8(203, 213, 225, 255),
+            keycap_hover_border: Color::from_rgba8(148, 163, 184, 255),
+            toggle_off_track: Color::from_rgba8(203, 213, 225, 255),
+            toggle_off_border: Color::from_rgba8(15, 23, 42, 20),
+            seg_bg: Color::from_rgba8(241, 245, 249, 255),
+            seg_border: Color::from_rgba8(203, 213, 225, 255),
+            seg_active_bg: Color::from_rgba8(14, 165, 233, 255),
+            seg_hover_bg: Color::from_rgba8(15, 23, 42, 12),
+            ghost_bg: Color::from_rgba8(255, 255, 255, 255),
+            ghost_hover_bg: Color::from_rgba8(241, 245, 249, 255),
+            ghost_border: Color::from_rgba8(203, 213, 225, 255),
+            ghost_hover_border: Color::from_rgba8(148, 163, 184, 255),
+            ghost_danger_bg: Color::from_rgba8(255, 241, 242, 255),
+            ghost_danger_hover_bg: Color::from_rgba8(255, 228, 230, 255),
+            ghost_danger_border: Color::from_rgba8(254, 205, 211, 255),
+            ghost_danger_hover_border: Color::from_rgba8(251, 113, 133, 255),
+            progress_track: Color::from_rgba8(226, 232, 240, 255),
+            toast_muted_bg: Color::from_rgba8(255, 255, 255, 255),
+            toast_muted_border: Color::from_rgba8(203, 213, 225, 255),
+            badge_ok_bg: Color::from_rgba8(236, 253, 245, 255),
+            badge_warn_bg: Color::from_rgba8(254, 243, 199, 255),
+            badge_err_bg: Color::from_rgba8(255, 228, 230, 255),
+        }
+    }
+
+    fn dark() -> Self {
+        Self {
+            dark: true,
+            dwm_caption: (11, 17, 32),
+            dwm_text: (226, 232, 240),
+            sidebar_bg: Color::from_rgba8(11, 17, 32, 255),
+            canvas_bg: Color::from_rgba8(15, 23, 42, 255),
+            hairline: Color::from_rgba8(255, 255, 255, 18),
+            card_bg: Color::from_rgba8(22, 32, 50, 255),
+            card_sub_bg: Color::from_rgba8(18, 27, 45, 255),
+            card_border: Color::from_rgba8(255, 255, 255, 18),
+            divider: Color::from_rgba8(255, 255, 255, 14),
+            row_hover: Color::from_rgba8(255, 255, 255, 9),
+            nav_active_bg: Color::from_rgba8(56, 189, 248, 32),
+            nav_active_bar: Color::from_rgba8(56, 189, 248, 255),
+            nav_hover_bg: Color::from_rgba8(255, 255, 255, 12),
+            nav_icon_active: Color::from_rgba8(56, 189, 248, 255),
+            nav_icon_idle: Color::from_rgba8(148, 163, 184, 255),
+            nav_txt_active: (248, 250, 252),
+            nav_txt_hover: (226, 232, 240),
+            nav_txt_idle: (148, 163, 184),
+            text_primary: (248, 250, 252),
+            text_body: (203, 213, 225),
+            text_secondary: (148, 163, 184),
+            text_muted: (100, 116, 139),
+            text_accent: (125, 211, 252),
+            text_success: (52, 211, 153),
+            text_warning: (251, 191, 36),
+            text_danger: (251, 113, 133),
+            text_danger_soft: (248, 165, 178),
+            input_bg: Color::from_rgba8(14, 22, 39, 255),
+            input_bg_rgb: (14, 22, 39),
+            input_text_rgb: (241, 245, 249),
+            input_border: Color::from_rgba8(42, 56, 82, 255),
+            input_border_focus: Color::from_rgba8(56, 189, 248, 255),
+            keycap_bg: Color::from_rgba8(14, 22, 39, 255),
+            keycap_hover_bg: Color::from_rgba8(30, 41, 59, 255),
+            keycap_rec_bg: Color::from_rgba8(14, 165, 233, 42),
+            keycap_border: Color::from_rgba8(42, 56, 82, 255),
+            keycap_hover_border: Color::from_rgba8(71, 85, 105, 255),
+            toggle_off_track: Color::from_rgba8(51, 65, 85, 255),
+            toggle_off_border: Color::from_rgba8(255, 255, 255, 22),
+            seg_bg: Color::from_rgba8(14, 22, 39, 255),
+            seg_border: Color::from_rgba8(42, 56, 82, 255),
+            seg_active_bg: Color::from_rgba8(14, 165, 233, 220),
+            seg_hover_bg: Color::from_rgba8(255, 255, 255, 16),
+            ghost_bg: Color::from_rgba8(28, 40, 62, 255),
+            ghost_hover_bg: Color::from_rgba8(42, 56, 82, 255),
+            ghost_border: Color::from_rgba8(255, 255, 255, 24),
+            ghost_hover_border: Color::from_rgba8(100, 116, 139, 140),
+            ghost_danger_bg: Color::from_rgba8(244, 63, 94, 18),
+            ghost_danger_hover_bg: Color::from_rgba8(244, 63, 94, 46),
+            ghost_danger_border: Color::from_rgba8(244, 63, 94, 60),
+            ghost_danger_hover_border: Color::from_rgba8(244, 63, 94, 140),
+            progress_track: Color::from_rgba8(15, 23, 42, 255),
+            toast_muted_bg: Color::from_rgba8(255, 255, 255, 12),
+            toast_muted_border: Color::from_rgba8(255, 255, 255, 20),
+            badge_ok_bg: Color::from_rgba8(16, 185, 129, 30),
+            badge_warn_bg: Color::from_rgba8(245, 158, 11, 28),
+            badge_err_bg: Color::from_rgba8(244, 63, 94, 28),
+        }
+    }
+}
+
+fn apply_dwm_theme(hwnd: HWND, dark: bool) {
+    let p = Palette::for_dark(dark);
+    unsafe {
+        let dark_flag: i32 = if dark { 1 } else { 0 };
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark_flag as *const i32 as *const _,
+            std::mem::size_of::<i32>() as u32,
+        );
+        let cap_color = rgb_colorref(p.dwm_caption.0, p.dwm_caption.1, p.dwm_caption.2);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR,
+            &cap_color as *const COLORREF as *const _,
+            std::mem::size_of::<COLORREF>() as u32,
+        );
+        let txt_color = rgb_colorref(p.dwm_text.0, p.dwm_text.1, p.dwm_text.2);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TEXT_COLOR,
+            &txt_color as *const COLORREF as *const _,
+            std::mem::size_of::<COLORREF>() as u32,
+        );
+        let corner = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &corner as *const _ as *const _,
+            std::mem::size_of_val(&corner) as u32,
+        );
+    }
 }
 
 thread_local! {
@@ -203,12 +438,13 @@ pub fn open_settings(
     let sx = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let sy = unsafe { GetSystemMetrics(SM_CYSCREEN) };
 
+    let win_style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
     let Ok(hwnd) = (unsafe {
         CreateWindowExW(
             Default::default(),
             PCWSTR(class_w.as_ptr()),
             PCWSTR(title_w.as_ptr()),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+            win_style,
             (sx - logical_w) / 2,
             (sy - logical_h) / 2,
             logical_w,
@@ -222,40 +458,10 @@ pub fn open_settings(
         return;
     };
 
-    // Enable Windows 11 native dark titlebar + rounded corners matching our slate theme
-    unsafe {
-        let dark: i32 = 1;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
-            &dark as *const i32 as *const _,
-            std::mem::size_of::<i32>() as u32,
-        );
-        let cap_color = rgb_colorref(11, 17, 32);
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_CAPTION_COLOR,
-            &cap_color as *const COLORREF as *const _,
-            std::mem::size_of::<COLORREF>() as u32,
-        );
-        let txt_color = rgb_colorref(226, 232, 240);
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_TEXT_COLOR,
-            &txt_color as *const COLORREF as *const _,
-            std::mem::size_of::<COLORREF>() as u32,
-        );
-        let corner = DWMWCP_ROUND;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            &corner as *const _ as *const _,
-            std::mem::size_of_val(&corner) as u32,
-        );
-    }
+    // Apply Windows 11 native light/dark titlebar + rounded corners matching active theme
+    apply_dwm_theme(hwnd, config.theme.is_dark());
 
     let dpi = window_dpi(hwnd);
-    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     let mut adj = RECT {
         left: 0,
         top: 0,
@@ -265,7 +471,7 @@ pub fn open_settings(
     unsafe {
         let _ = windows::Win32::UI::HiDpi::AdjustWindowRectExForDpi(
             &mut adj,
-            style,
+            win_style,
             false,
             Default::default(),
             dpi,
@@ -312,7 +518,8 @@ pub fn open_settings(
         font_body_bold: OwnedFont(create_ui_font(dpi, 9, true)),
         font_small: OwnedFont(create_ui_font(dpi, 8, false)),
         font_input: OwnedFont(create_ui_font(dpi, 9, false)),
-        edit_bg_brush: OwnedBrush::solid(14, 22, 39),
+        edit_bg_light: OwnedBrush::solid(248, 250, 252),
+        edit_bg_dark: OwnedBrush::solid(14, 22, 39),
         updater,
         callbacks,
     });
@@ -461,6 +668,44 @@ impl SettingsWindow {
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
+    }
+
+    fn request_stats_repaint(&self) {
+        let r = RECT {
+            left: self.s(12),
+            top: self.client_h - self.s(106),
+            right: self.s(190) - self.s(12),
+            bottom: self.client_h - self.s(16),
+        };
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), Some(&r), false);
+        }
+    }
+
+    fn is_dark(&self) -> bool {
+        self.cfg.borrow().theme.is_dark()
+    }
+
+    fn palette(&self) -> Palette {
+        Palette::for_dark(self.is_dark())
+    }
+
+    fn refresh_theme_surfaces(&self) {
+        apply_dwm_theme(self.hwnd, self.is_dark());
+        for eh in [
+            self.edits.save_dir,
+            self.edits.cnb_url,
+            self.edits.github_url,
+            self.edits.proxy_host,
+            self.edits.proxy_port,
+        ] {
+            if !eh.is_invalid() {
+                unsafe {
+                    let _ = InvalidateRect(Some(eh), None, true);
+                }
+            }
+        }
+        self.request_repaint();
     }
 
     fn create_borderless_edit(&self, text: &str, id: usize, rect: RectI) -> HWND {
@@ -752,23 +997,6 @@ impl SettingsWindow {
         true
     }
 
-    fn launch_preview_splash(&self) {
-        if let Ok(exe) = std::env::current_exe() {
-            let mut cmd = std::process::Command::new(exe);
-            cmd.args([
-                "--update-splash",
-                "--from-version",
-                APP_VERSION,
-                "--to-version",
-                "0.2.0",
-                "--demo-ms",
-                "3600",
-            ])
-            .creation_flags(0x0800_0000);
-            let _ = cmd.spawn();
-        }
-    }
-
     fn handle_click(&self, kind: HitKind) {
         match kind {
             HitKind::NavTab(t) => self.switch_tab(t),
@@ -783,6 +1011,11 @@ impl SettingsWindow {
                         _ => cfg.toggle_pins_hotkey.clear(),
                     }
                 }
+                self.save_config(false);
+            }
+            HitKind::ThemeSeg(idx) => {
+                self.cfg.borrow_mut().theme = ThemeMode::from_index(idx);
+                self.refresh_theme_surfaces();
                 self.save_config(false);
             }
             HitKind::ToggleAutoStart => {
@@ -848,9 +1081,6 @@ impl SettingsWindow {
             HitKind::UpdateCancel => {
                 self.updater.cancel();
             }
-            HitKind::UpdatePreviewSplash => {
-                self.launch_preview_splash();
-            }
             HitKind::UpdateSourceSeg(idx) => {
                 self.cfg.borrow_mut().update.preferred_source = UpdateProvider::from_index(idx);
                 self.save_config(false);
@@ -885,30 +1115,30 @@ impl SettingsWindow {
         let mut texts: Vec<(String, RectI, (u8, u8, u8), FontSlot, u32)> = Vec::new();
 
         let cfg = self.cfg.borrow().clone();
+        let p = Palette::for_dark(cfg.theme.is_dark());
         let active_tab = self.active_tab.get();
         let hovered = self.hovered.get();
         let recording = self.recording_slot.get();
         let focused_edit = self.focused_edit.get();
 
         if let Some(mut pm) = Pixmap::new(w as u32, h as u32) {
-            // 1. Canvas backgrounds: deeper obsidian sidebar (#0B1120) + modern slate content (#0F172A)
-            fill_rect(&mut pm, 0.0, 0.0, sidebar_w as f32, h as f32, Color::from_rgba8(11, 17, 32, 255));
+            // 1. Canvas backgrounds: sidebar + content + subtle divider
+            fill_rect(&mut pm, 0.0, 0.0, sidebar_w as f32, h as f32, p.sidebar_bg);
             fill_rect(
                 &mut pm,
                 sidebar_w as f32,
                 0.0,
                 (w - sidebar_w) as f32,
                 h as f32,
-                Color::from_rgba8(15, 23, 42, 255),
+                p.canvas_bg,
             );
-            // Hairline vertical divider between sidebar and content
             fill_rect(
                 &mut pm,
                 sidebar_w as f32,
                 0.0,
                 (1.0 * sf).max(1.0),
                 h as f32,
-                Color::from_rgba8(255, 255, 255, 18),
+                p.hairline,
             );
 
             // 2. Sidebar Brand Header
@@ -916,14 +1146,14 @@ impl SettingsWindow {
             texts.push((
                 "RHPicture".into(),
                 RectI::new(s(62), s(18), sidebar_w - s(10), s(40)),
-                (248, 250, 252),
+                p.text_primary,
                 FontSlot::Brand,
                 DT_LEFT.0,
             ));
             texts.push((
                 format!("v{APP_VERSION} · 极简截图"),
                 RectI::new(s(62), s(38), sidebar_w - s(10), s(56)),
-                (100, 116, 139),
+                p.text_muted,
                 FontSlot::Small,
                 DT_LEFT.0,
             ));
@@ -946,9 +1176,8 @@ impl SettingsWindow {
                         rect.width() as f32,
                         rect.height() as f32,
                         9.0 * sf,
-                        Color::from_rgba8(56, 189, 248, 32),
+                        p.nav_active_bg,
                     );
-                    // Glowing vertical indicator bar
                     fill_rrect(
                         &mut pm,
                         rect.left as f32 + 2.0 * sf,
@@ -956,7 +1185,7 @@ impl SettingsWindow {
                         3.0 * sf,
                         rect.height() as f32 - 18.0 * sf,
                         1.5 * sf,
-                        Color::from_rgba8(56, 189, 248, 255),
+                        p.nav_active_bar,
                     );
                 } else if is_hover {
                     fill_rrect(
@@ -966,14 +1195,14 @@ impl SettingsWindow {
                         rect.width() as f32,
                         rect.height() as f32,
                         9.0 * sf,
-                        Color::from_rgba8(255, 255, 255, 12),
+                        p.nav_hover_bg,
                     );
                 }
 
                 let icon_col = if is_active {
-                    Color::from_rgba8(56, 189, 248, 255)
+                    p.nav_icon_active
                 } else {
-                    Color::from_rgba8(148, 163, 184, 255)
+                    p.nav_icon_idle
                 };
                 draw_nav_icon(
                     &mut pm,
@@ -984,11 +1213,11 @@ impl SettingsWindow {
                     icon_col,
                 );
                 let txt_col = if is_active {
-                    (248, 250, 252)
+                    p.nav_txt_active
                 } else if is_hover {
-                    (226, 232, 240)
+                    p.nav_txt_hover
                 } else {
-                    (148, 163, 184)
+                    p.nav_txt_idle
                 };
                 texts.push((
                     label.into(),
@@ -1001,37 +1230,37 @@ impl SettingsWindow {
 
             // 4. Sidebar Bottom Live Zero-VRAM Resource Card
             let res_rect = RectI::new(s(12), h - s(106), sidebar_w - s(12), h - s(16));
-            draw_card(&mut pm, res_rect, 10.0 * sf, sf, Color::from_rgba8(18, 27, 45, 255));
+            draw_card(&mut pm, res_rect, 10.0 * sf, sf, p.card_sub_bg, &p);
             if let Some(dot) = PathBuilder::from_circle(
                 (res_rect.left + s(16)) as f32,
                 (res_rect.top + s(18)) as f32,
                 3.5 * sf,
             ) {
-                let mut p = Paint::default();
-                p.set_color(Color::from_rgba8(52, 211, 153, 255));
-                p.anti_alias = true;
-                pm.fill_path(&dot, &p, FillRule::Winding, Transform::identity(), None);
+                let mut dot_p = Paint::default();
+                dot_p.set_color(Color::from_rgba8(16, 185, 129, 255));
+                dot_p.anti_alias = true;
+                pm.fill_path(&dot, &dot_p, FillRule::Winding, Transform::identity(), None);
             }
             let mem = process_memory_mb();
             let (vis, hid) = pin::pin_counts();
             texts.push((
                 "零显存引擎".into(),
                 RectI::new(res_rect.left + s(26), res_rect.top + s(8), res_rect.right - s(8), res_rect.top + s(28)),
-                (52, 211, 153),
+                p.text_success,
                 FontSlot::Small,
                 DT_LEFT.0,
             ));
             texts.push((
                 format!("内存 {mem:.1} MB · 显存 0 MB"),
                 RectI::new(res_rect.left + s(12), res_rect.top + s(34), res_rect.right - s(8), res_rect.top + s(54)),
-                (203, 213, 225),
+                p.text_body,
                 FontSlot::Small,
                 DT_LEFT.0,
             ));
             texts.push((
                 format!("贴图：{vis} 显示 / {hid} 隐藏"),
                 RectI::new(res_rect.left + s(12), res_rect.top + s(56), res_rect.right - s(8), res_rect.top + s(78)),
-                (148, 163, 184),
+                p.text_secondary,
                 FontSlot::Small,
                 DT_LEFT.0,
             ));
@@ -1045,7 +1274,7 @@ impl SettingsWindow {
             texts.push((
                 page_title.into(),
                 RectI::new(content_x, s(18), content_x + s(220), s(52)),
-                (248, 250, 252),
+                p.text_primary,
                 FontSlot::H1,
                 DT_LEFT.0,
             ));
@@ -1053,25 +1282,21 @@ impl SettingsWindow {
             let (toast_txt, toast_tone) = self.toast.borrow().clone();
             if !toast_txt.is_empty() {
                 let (bg, fg, border) = match toast_tone {
-                    ToastTone::Muted => (
-                        Color::from_rgba8(255, 255, 255, 12),
-                        (148, 163, 184),
-                        Color::from_rgba8(255, 255, 255, 20),
-                    ),
+                    ToastTone::Muted => (p.toast_muted_bg, p.text_secondary, p.toast_muted_border),
                     ToastTone::Success => (
-                        Color::from_rgba8(16, 185, 129, 28),
-                        (52, 211, 153),
-                        Color::from_rgba8(52, 211, 153, 85),
+                        p.badge_ok_bg,
+                        p.text_success,
+                        Color::from_rgba8(16, 185, 129, if p.dark { 85 } else { 95 }),
                     ),
                     ToastTone::Warning => (
-                        Color::from_rgba8(245, 158, 11, 28),
-                        (251, 191, 36),
-                        Color::from_rgba8(251, 191, 36, 90),
+                        p.badge_warn_bg,
+                        p.text_warning,
+                        Color::from_rgba8(245, 158, 11, if p.dark { 90 } else { 110 }),
                     ),
                     ToastTone::Error => (
-                        Color::from_rgba8(244, 63, 94, 28),
-                        (251, 113, 133),
-                        Color::from_rgba8(244, 63, 94, 95),
+                        p.badge_err_bg,
+                        p.text_danger,
+                        Color::from_rgba8(244, 63, 94, if p.dark { 95 } else { 110 }),
                     ),
                 };
                 let pill_w = ((toast_txt.chars().count() as i32) * s(11) + s(24))
@@ -1111,13 +1336,13 @@ impl SettingsWindow {
                     // --- Section: Global Hotkeys ---
                     texts.push((
                         "全局快捷键".into(),
-                        RectI::new(content_x + s(2), s(66), content_r, s(86)),
-                        (148, 163, 184),
+                        RectI::new(content_x + s(2), s(60), content_r, s(78)),
+                        p.text_secondary,
                         FontSlot::Section,
                         DT_LEFT.0,
                     ));
-                    let hk_card = RectI::new(content_x, s(88), content_r, s(238));
-                    draw_card(&mut pm, hk_card, 11.0 * sf, sf, Color::from_rgba8(22, 32, 50, 255));
+                    let hk_card = RectI::new(content_x, s(80), content_r, s(224));
+                    draw_card(&mut pm, hk_card, 11.0 * sf, sf, p.card_bg, &p);
 
                     let hk_rows = [
                         (0usize, "开始截图", "全局唤起多屏截图选区", cfg.screenshot_hotkey.as_str()),
@@ -1125,45 +1350,45 @@ impl SettingsWindow {
                         (2usize, "隐藏 / 显示全部贴图", "一键切换所有贴图的显示与隐藏", cfg.toggle_pins_hotkey.as_str()),
                     ];
                     for (idx, title, desc, val) in hk_rows {
-                        let ry = hk_card.top + (idx as i32) * s(50);
+                        let ry = hk_card.top + (idx as i32) * s(48);
                         if idx > 0 {
-                            draw_divider(&mut pm, hk_card.left + s(16), ry, hk_card.right - s(16), sf);
+                            draw_divider(&mut pm, hk_card.left + s(16), ry, hk_card.right - s(16), sf, &p);
                         }
                         texts.push((
                             title.into(),
-                            RectI::new(hk_card.left + s(16), ry + s(7), hk_card.left + s(260), ry + s(27)),
-                            (241, 245, 249),
+                            RectI::new(hk_card.left + s(16), ry + s(6), hk_card.left + s(260), ry + s(26)),
+                            p.text_primary,
                             FontSlot::BodyBold,
                             DT_LEFT.0,
                         ));
                         texts.push((
                             desc.into(),
-                            RectI::new(hk_card.left + s(16), ry + s(26), hk_card.left + s(270), ry + s(44)),
-                            (148, 163, 184),
+                            RectI::new(hk_card.left + s(16), ry + s(25), hk_card.left + s(270), ry + s(42)),
+                            p.text_secondary,
                             FontSlot::Small,
                             DT_LEFT.0,
                         ));
 
-                        let clr_rect = RectI::new(hk_card.right - s(40), ry + s(11), hk_card.right - s(14), ry + s(39));
-                        let key_rect = RectI::new(clr_rect.left - s(142), ry + s(11), clr_rect.left - s(8), ry + s(39));
+                        let clr_rect = RectI::new(hk_card.right - s(40), ry + s(10), hk_card.right - s(14), ry + s(38));
+                        let key_rect = RectI::new(clr_rect.left - s(142), ry + s(10), clr_rect.left - s(8), ry + s(38));
                         hits.push(HitZone { rect: key_rect, kind: HitKind::HotkeyRecord(idx) });
                         hits.push(HitZone { rect: clr_rect, kind: HitKind::HotkeyClear(idx) });
 
                         let is_rec = recording == Some(idx);
                         let is_hov = hovered == Some(HitKind::HotkeyRecord(idx));
                         let kbg = if is_rec {
-                            Color::from_rgba8(14, 165, 233, 42)
+                            p.keycap_rec_bg
                         } else if is_hov {
-                            Color::from_rgba8(30, 41, 59, 255)
+                            p.keycap_hover_bg
                         } else {
-                            Color::from_rgba8(14, 22, 39, 255)
+                            p.keycap_bg
                         };
                         let kborder = if is_rec {
-                            Color::from_rgba8(56, 189, 248, 255)
+                            p.input_border_focus
                         } else if is_hov {
-                            Color::from_rgba8(71, 85, 105, 255)
+                            p.keycap_hover_border
                         } else {
-                            Color::from_rgba8(42, 56, 82, 255)
+                            p.keycap_border
                         };
                         fill_rrect(&mut pm, key_rect.left as f32, key_rect.top as f32, key_rect.width() as f32, key_rect.height() as f32, 7.0 * sf, kbg);
                         stroke_rrect(&mut pm, key_rect.left as f32 + 0.5 * sf, key_rect.top as f32 + 0.5 * sf, key_rect.width() as f32 - sf, key_rect.height() as f32 - sf, 6.5 * sf, if is_rec { 1.5 * sf } else { 1.0 * sf }, kborder);
@@ -1176,38 +1401,72 @@ impl SettingsWindow {
                             val.to_string()
                         };
                         let txt_c = if is_rec {
-                            (125, 211, 252)
+                            p.text_accent
                         } else if val.trim().is_empty() {
-                            (100, 116, 139)
+                            p.text_muted
                         } else {
-                            (248, 250, 252)
+                            p.text_primary
                         };
                         texts.push((display, key_rect, txt_c, FontSlot::BodyBold, DT_CENTER.0));
 
-                        // Subtle × clear button
                         let clr_hov = hovered == Some(HitKind::HotkeyClear(idx));
                         if clr_hov {
-                            fill_rrect(&mut pm, clr_rect.left as f32, clr_rect.top as f32, clr_rect.width() as f32, clr_rect.height() as f32, 6.0 * sf, Color::from_rgba8(244, 63, 94, 40));
+                            fill_rrect(&mut pm, clr_rect.left as f32, clr_rect.top as f32, clr_rect.width() as f32, clr_rect.height() as f32, 6.0 * sf, p.ghost_danger_hover_bg);
                         }
                         texts.push((
                             "×".into(),
                             clr_rect,
-                            if clr_hov { (251, 113, 133) } else { (100, 116, 139) },
+                            if clr_hov { p.text_danger } else { p.text_muted },
                             FontSlot::BodyBold,
                             DT_CENTER.0,
                         ));
                     }
 
-                    // --- Section: General Toggles ---
+                    // --- Section: Appearance & General ---
                     texts.push((
-                        "常规与截图体验".into(),
-                        RectI::new(content_x + s(2), s(252), content_r, s(272)),
-                        (148, 163, 184),
+                        "外观与常规".into(),
+                        RectI::new(content_x + s(2), s(236), content_r, s(254)),
+                        p.text_secondary,
                         FontSlot::Section,
                         DT_LEFT.0,
                     ));
-                    let gen_card = RectI::new(content_x, s(274), content_r, s(424));
-                    draw_card(&mut pm, gen_card, 11.0 * sf, sf, Color::from_rgba8(22, 32, 50, 255));
+                    let gen_card = RectI::new(content_x, s(256), content_r, s(444));
+                    draw_card(&mut pm, gen_card, 11.0 * sf, sf, p.card_bg, &p);
+
+                    // Row 0: Theme Mode (Light / System / Dark)
+                    let row_h = s(47);
+                    texts.push((
+                        "外观主题".into(),
+                        RectI::new(gen_card.left + s(16), gen_card.top + s(6), gen_card.left + s(210), gen_card.top + s(25)),
+                        p.text_primary,
+                        FontSlot::BodyBold,
+                        DT_LEFT.0,
+                    ));
+                    texts.push((
+                        "默认浅色，可随 Windows 系统自动切换".into(),
+                        RectI::new(gen_card.left + s(16), gen_card.top + s(24), gen_card.left + s(260), gen_card.top + s(41)),
+                        p.text_secondary,
+                        FontSlot::Small,
+                        DT_LEFT.0,
+                    ));
+                    let theme_seg = RectI::new(
+                        gen_card.right - s(228),
+                        gen_card.top + s(9),
+                        gen_card.right - s(16),
+                        gen_card.top + s(38),
+                    );
+                    draw_segmented_bar(
+                        &mut pm,
+                        &mut hits,
+                        &mut texts,
+                        theme_seg,
+                        sf,
+                        &["浅色", "跟随系统", "深色"],
+                        cfg.theme.index(),
+                        hovered,
+                        HitKind::ThemeSeg,
+                        &p,
+                    );
 
                     let toggles = [
                         (HitKind::ToggleAutoStart, "开机自动启动", "后台静默常驻托盘，零显存占用", cfg.auto_start),
@@ -1215,11 +1474,9 @@ impl SettingsWindow {
                         (HitKind::ToggleMagnifier, "像素放大镜与取色器", "悬停显示放大像素格，按 C 直接复制 #HEX", cfg.show_magnifier),
                     ];
                     for (i, (kind, title, desc, on)) in toggles.into_iter().enumerate() {
-                        let ry = gen_card.top + (i as i32) * s(50);
-                        if i > 0 {
-                            draw_divider(&mut pm, gen_card.left + s(16), ry, gen_card.right - s(16), sf);
-                        }
-                        let row_rect = RectI::new(gen_card.left, ry, gen_card.right, ry + s(50));
+                        let ry = gen_card.top + ((i + 1) as i32) * row_h;
+                        draw_divider(&mut pm, gen_card.left + s(16), ry, gen_card.right - s(16), sf, &p);
+                        let row_rect = RectI::new(gen_card.left, ry, gen_card.right, ry + row_h);
                         hits.push(HitZone { rect: row_rect, kind });
                         if hovered == Some(kind) {
                             fill_rrect(
@@ -1229,60 +1486,61 @@ impl SettingsWindow {
                                 (row_rect.width() - s(8)) as f32,
                                 (row_rect.height() - s(8)) as f32,
                                 8.0 * sf,
-                                Color::from_rgba8(255, 255, 255, 9),
+                                p.row_hover,
                             );
                         }
                         texts.push((
                             title.into(),
-                            RectI::new(gen_card.left + s(16), ry + s(7), gen_card.right - s(80), ry + s(27)),
-                            (241, 245, 249),
+                            RectI::new(gen_card.left + s(16), ry + s(6), gen_card.right - s(80), ry + s(25)),
+                            p.text_primary,
                             FontSlot::BodyBold,
                             DT_LEFT.0,
                         ));
                         texts.push((
                             desc.into(),
-                            RectI::new(gen_card.left + s(16), ry + s(26), gen_card.right - s(80), ry + s(44)),
-                            (148, 163, 184),
+                            RectI::new(gen_card.left + s(16), ry + s(24), gen_card.right - s(80), ry + s(41)),
+                            p.text_secondary,
                             FontSlot::Small,
                             DT_LEFT.0,
                         ));
                         draw_toggle_switch(
                             &mut pm,
                             (gen_card.right - s(58)) as f32,
-                            (ry + s(14)) as f32,
+                            (ry + s(12)) as f32,
                             sf,
                             on,
+                            &p,
                         );
                     }
 
                     // --- Compact Tips Card ---
-                    let tip_card = RectI::new(content_x, s(438), content_r, h - s(20));
-                    draw_card(&mut pm, tip_card, 11.0 * sf, sf, Color::from_rgba8(18, 27, 45, 255));
+                    let tip_card = RectI::new(content_x, s(458), content_r, h - s(16));
+                    draw_card(&mut pm, tip_card, 11.0 * sf, sf, p.card_sub_bg, &p);
                     texts.push((
                         "快捷操作速查".into(),
                         RectI::new(tip_card.left + s(16), tip_card.top + s(10), tip_card.right - s(16), tip_card.top + s(28)),
-                        (125, 211, 252),
+                        p.text_accent,
                         FontSlot::Small,
                         DT_LEFT.0,
                     ));
                     texts.push((
                         "截图时：双击选区 / Enter 复制 · F3 / T 贴图 · Ctrl+S 保存 · 右键重选 · 方向键 1px 微调".into(),
-                        RectI::new(tip_card.left + s(16), tip_card.top + s(32), tip_card.right - s(14), tip_card.top + s(54)),
-                        (148, 163, 184),
+                        RectI::new(tip_card.left + s(16), tip_card.top + s(32), tip_card.right - s(14), tip_card.top + s(53)),
+                        p.text_secondary,
                         FontSlot::Small,
                         DT_LEFT.0 | DT_END_ELLIPSIS.0,
                     ));
                     texts.push((
                         "贴图上：左键拖动 · 滚轮缩放 · Ctrl+滚轮透明度 · 双击/H 隐藏 · R 旋转 · Esc 关闭".into(),
-                        RectI::new(tip_card.left + s(16), tip_card.top + s(56), tip_card.right - s(14), tip_card.top + s(78)),
-                        (148, 163, 184),
+                        RectI::new(tip_card.left + s(16), tip_card.top + s(54), tip_card.right - s(14), tip_card.top + s(75)),
+                        p.text_secondary,
                         FontSlot::Small,
                         DT_LEFT.0 | DT_END_ELLIPSIS.0,
                     ));
                     texts.push((
                         "取色器：悬停像素放大镜按 C 复制 #HEX 色值 · 快捷键直接将剪贴板图片贴图".into(),
-                        RectI::new(tip_card.left + s(16), tip_card.top + s(80), tip_card.right - s(14), tip_card.top + s(102)),
-                        (148, 163, 184),
+                        RectI::new(tip_card.left + s(16), tip_card.top + s(76), tip_card.right - s(14), tip_card.top + s(97)),
+                        p.text_secondary,
                         FontSlot::Small,
                         DT_LEFT.0 | DT_END_ELLIPSIS.0,
                     ));
@@ -1292,32 +1550,32 @@ impl SettingsWindow {
                     texts.push((
                         "本地保存".into(),
                         RectI::new(content_x + s(2), s(66), content_r, s(86)),
-                        (148, 163, 184),
+                        p.text_secondary,
                         FontSlot::Section,
                         DT_LEFT.0,
                     ));
                     let save_card = RectI::new(content_x, s(88), content_r, s(260));
-                    draw_card(&mut pm, save_card, 11.0 * sf, sf, Color::from_rgba8(22, 32, 50, 255));
+                    draw_card(&mut pm, save_card, 11.0 * sf, sf, p.card_bg, &p);
 
                     texts.push((
                         "默认保存目录".into(),
                         RectI::new(save_card.left + s(16), s(96), save_card.right - s(16), s(116)),
-                        (203, 213, 225),
+                        p.text_body,
                         FontSlot::Small,
                         DT_LEFT.0,
                     ));
                     let dir_box = self.save_dir_box();
-                    draw_input_frame(&mut pm, dir_box, sf, focused_edit == Some(ID_EDIT_SAVE_DIR));
+                    draw_input_frame(&mut pm, dir_box, sf, focused_edit == Some(ID_EDIT_SAVE_DIR), &p);
                     let browse_rect = RectI::new(dir_box.right + s(8), dir_box.top, save_card.right - s(16), dir_box.bottom);
                     hits.push(HitZone { rect: browse_rect, kind: HitKind::BrowseSaveDir });
-                    draw_ghost_button(&mut pm, browse_rect, sf, hovered == Some(HitKind::BrowseSaveDir), false);
-                    texts.push(("浏览…".into(), browse_rect, (226, 232, 240), FontSlot::Body, DT_CENTER.0));
+                    draw_ghost_button(&mut pm, browse_rect, sf, hovered == Some(HitKind::BrowseSaveDir), false, &p);
+                    texts.push(("浏览…".into(), browse_rect, p.text_body, FontSlot::Body, DT_CENTER.0));
 
-                    draw_divider(&mut pm, save_card.left + s(16), s(162), save_card.right - s(16), sf);
+                    draw_divider(&mut pm, save_card.left + s(16), s(162), save_card.right - s(16), sf, &p);
                     texts.push((
                         "默认保存格式".into(),
                         RectI::new(save_card.left + s(16), s(166), save_card.left + s(150), s(208)),
-                        (241, 245, 249),
+                        p.text_primary,
                         FontSlot::BodyBold,
                         DT_LEFT.0,
                     ));
@@ -1332,45 +1590,46 @@ impl SettingsWindow {
                         cfg.save_format.index(),
                         hovered,
                         HitKind::FormatSeg,
+                        &p,
                     );
 
-                    draw_divider(&mut pm, save_card.left + s(16), s(212), save_card.right - s(16), sf);
+                    draw_divider(&mut pm, save_card.left + s(16), s(212), save_card.right - s(16), sf, &p);
                     let qs_row = RectI::new(save_card.left, s(212), save_card.right, s(260));
                     hits.push(HitZone { rect: qs_row, kind: HitKind::ToggleQuickSave });
                     if hovered == Some(HitKind::ToggleQuickSave) {
-                        fill_rrect(&mut pm, (qs_row.left + s(4)) as f32, (qs_row.top + s(4)) as f32, (qs_row.width() - s(8)) as f32, (qs_row.height() - s(8)) as f32, 8.0 * sf, Color::from_rgba8(255, 255, 255, 9));
+                        fill_rrect(&mut pm, (qs_row.left + s(4)) as f32, (qs_row.top + s(4)) as f32, (qs_row.width() - s(8)) as f32, (qs_row.height() - s(8)) as f32, 8.0 * sf, p.row_hover);
                     }
                     texts.push((
                         "保存时直接存入默认目录".into(),
                         RectI::new(save_card.left + s(16), s(218), save_card.right - s(80), s(238)),
-                        (241, 245, 249),
+                        p.text_primary,
                         FontSlot::BodyBold,
                         DT_LEFT.0,
                     ));
                     texts.push((
                         "跳过系统「另存为」弹窗，按时间戳极速保存".into(),
                         RectI::new(save_card.left + s(16), s(237), save_card.right - s(80), s(254)),
-                        (148, 163, 184),
+                        p.text_secondary,
                         FontSlot::Small,
                         DT_LEFT.0,
                     ));
-                    draw_toggle_switch(&mut pm, (save_card.right - s(58)) as f32, s(225) as f32, sf, cfg.quick_save_no_dialog);
+                    draw_toggle_switch(&mut pm, (save_card.right - s(58)) as f32, s(225) as f32, sf, cfg.quick_save_no_dialog, &p);
 
                     // --- Section: Pin Behavior ---
                     texts.push((
                         "贴图窗口行为".into(),
                         RectI::new(content_x + s(2), s(276), content_r, s(296)),
-                        (148, 163, 184),
+                        p.text_secondary,
                         FontSlot::Section,
                         DT_LEFT.0,
                     ));
                     let pin_card = RectI::new(content_x, s(298), content_r, s(404));
-                    draw_card(&mut pm, pin_card, 11.0 * sf, sf, Color::from_rgba8(22, 32, 50, 255));
+                    draw_card(&mut pm, pin_card, 11.0 * sf, sf, p.card_bg, &p);
 
                     texts.push((
                         "双击贴图动作".into(),
                         RectI::new(pin_card.left + s(16), s(304), pin_card.left + s(150), s(348)),
-                        (241, 245, 249),
+                        p.text_primary,
                         FontSlot::BodyBold,
                         DT_LEFT.0,
                     ));
@@ -1385,40 +1644,41 @@ impl SettingsWindow {
                         cfg.pin_double_click.index(),
                         hovered,
                         HitKind::PinDblClkSeg,
+                        &p,
                     );
 
-                    draw_divider(&mut pm, pin_card.left + s(16), s(352), pin_card.right - s(16), sf);
+                    draw_divider(&mut pm, pin_card.left + s(16), s(352), pin_card.right - s(16), sf, &p);
                     let bd_row = RectI::new(pin_card.left, s(352), pin_card.right, s(404));
                     hits.push(HitZone { rect: bd_row, kind: HitKind::TogglePinBorder });
                     if hovered == Some(HitKind::TogglePinBorder) {
-                        fill_rrect(&mut pm, (bd_row.left + s(4)) as f32, (bd_row.top + s(4)) as f32, (bd_row.width() - s(8)) as f32, (bd_row.height() - s(8)) as f32, 8.0 * sf, Color::from_rgba8(255, 255, 255, 9));
+                        fill_rrect(&mut pm, (bd_row.left + s(4)) as f32, (bd_row.top + s(4)) as f32, (bd_row.width() - s(8)) as f32, (bd_row.height() - s(8)) as f32, 8.0 * sf, p.row_hover);
                     }
                     texts.push((
                         "贴图细边框保护".into(),
                         RectI::new(pin_card.left + s(16), s(359), pin_card.right - s(80), s(379)),
-                        (241, 245, 249),
+                        p.text_primary,
                         FontSlot::BodyBold,
                         DT_LEFT.0,
                     ));
                     texts.push((
                         "绘制极细外轮廓，防止白底截图融入浅色窗口".into(),
                         RectI::new(pin_card.left + s(16), s(378), pin_card.right - s(80), s(396)),
-                        (148, 163, 184),
+                        p.text_secondary,
                         FontSlot::Small,
                         DT_LEFT.0,
                     ));
-                    draw_toggle_switch(&mut pm, (pin_card.right - s(58)) as f32, s(367) as f32, sf, cfg.pin_show_border);
+                    draw_toggle_switch(&mut pm, (pin_card.right - s(58)) as f32, s(367) as f32, sf, cfg.pin_show_border, &p);
 
                     // --- Section: Pin Quick Management ---
                     texts.push((
                         "当前贴图快捷管理".into(),
                         RectI::new(content_x + s(2), s(420), content_r, s(440)),
-                        (148, 163, 184),
+                        p.text_secondary,
                         FontSlot::Section,
                         DT_LEFT.0,
                     ));
                     let mg_card = RectI::new(content_x, s(442), content_r, s(506));
-                    draw_card(&mut pm, mg_card, 11.0 * sf, sf, Color::from_rgba8(22, 32, 50, 255));
+                    draw_card(&mut pm, mg_card, 11.0 * sf, sf, p.card_bg, &p);
                     let gap = s(10);
                     let bw = (mg_card.width() - s(32) - gap * 2) / 3;
                     let actions = [
@@ -1430,13 +1690,13 @@ impl SettingsWindow {
                         let bx = mg_card.left + s(16) + (i as i32) * (bw + gap);
                         let br = RectI::new(bx, mg_card.top + s(15), bx + bw, mg_card.bottom - s(15));
                         hits.push(HitZone { rect: br, kind });
-                        draw_ghost_button(&mut pm, br, sf, hovered == Some(kind), danger);
+                        draw_ghost_button(&mut pm, br, sf, hovered == Some(kind), danger, &p);
                         let col = if danger && hovered == Some(kind) {
-                            (251, 113, 133)
+                            p.text_danger
                         } else if danger {
-                            (248, 165, 178)
+                            p.text_danger_soft
                         } else {
-                            (226, 232, 240)
+                            p.text_body
                         };
                         texts.push((label.into(), br, col, FontSlot::BodyBold, DT_CENTER.0));
                     }
@@ -1445,49 +1705,44 @@ impl SettingsWindow {
                     // --- Page 2: Updates ---
                     let snap = self.updater.snapshot();
                     let hero = RectI::new(content_x, s(66), content_r, s(206));
-                    draw_card(&mut pm, hero, 11.0 * sf, sf, Color::from_rgba8(22, 32, 50, 255));
+                    draw_card(&mut pm, hero, 11.0 * sf, sf, p.card_bg, &p);
 
                     // Top row: Version + mode badge + action buttons
                     texts.push((
                         format!("v{}", snap.current_version),
                         RectI::new(hero.left + s(16), hero.top + s(14), hero.left + s(88), hero.top + s(40)),
-                        (248, 250, 252),
+                        p.text_primary,
                         FontSlot::H1,
                         DT_LEFT.0,
                     ));
                     let (mode_txt, mode_bg, mode_fg) = if snap.managed {
-                        ("Velopack 增量更新", Color::from_rgba8(16, 185, 129, 30), (52, 211, 153))
+                        ("Velopack 增量更新", p.badge_ok_bg, p.text_success)
                     } else {
-                        ("独立运行模式", Color::from_rgba8(245, 158, 11, 28), (251, 191, 36))
+                        ("独立运行模式", p.badge_warn_bg, p.text_warning)
                     };
                     let mb = RectI::new(hero.left + s(90), hero.top + s(17), hero.left + s(212), hero.top + s(39));
                     fill_rrect(&mut pm, mb.left as f32, mb.top as f32, mb.width() as f32, mb.height() as f32, 11.0 * sf, mode_bg);
                     texts.push((mode_txt.into(), mb, mode_fg, FontSlot::Small, DT_CENTER.0));
 
-                    // Action buttons on right of hero header
-                    let preview_rect = RectI::new(hero.right - s(86), hero.top + s(14), hero.right - s(14), hero.top + s(44));
-                    hits.push(HitZone { rect: preview_rect, kind: HitKind::UpdatePreviewSplash });
-                    draw_ghost_button(&mut pm, preview_rect, sf, hovered == Some(HitKind::UpdatePreviewSplash), false);
-                    texts.push(("预览过渡".into(), preview_rect, (148, 163, 184), FontSlot::Small, DT_CENTER.0));
-
+                    // Action button on right of hero header
                     let sec_kind = if snap.busy && snap.cancellable {
                         HitKind::UpdateCancel
                     } else {
                         HitKind::UpdateRecheck
                     };
-                    let sec_rect = RectI::new(preview_rect.left - s(78), hero.top + s(14), preview_rect.left - s(8), hero.top + s(44));
+                    let sec_rect = RectI::new(hero.right - s(84), hero.top + s(14), hero.right - s(14), hero.top + s(44));
                     if !snap.busy || snap.cancellable {
                         hits.push(HitZone { rect: sec_rect, kind: sec_kind });
                     }
-                    draw_ghost_button(&mut pm, sec_rect, sf, hovered == Some(sec_kind), sec_kind == HitKind::UpdateCancel);
+                    draw_ghost_button(&mut pm, sec_rect, sf, hovered == Some(sec_kind), sec_kind == HitKind::UpdateCancel, &p);
                     let sec_label = if sec_kind == HitKind::UpdateCancel { "取消" } else { "重检" };
-                    texts.push((sec_label.into(), sec_rect, (226, 232, 240), FontSlot::Body, DT_CENTER.0));
+                    texts.push((sec_label.into(), sec_rect, p.text_body, FontSlot::Body, DT_CENTER.0));
 
                     let pri_rect = RectI::new(hero.left + s(16), hero.top + s(56), hero.left + s(190), hero.top + s(88));
                     if !snap.busy {
                         hits.push(HitZone { rect: pri_rect, kind: HitKind::UpdatePrimary });
                     }
-                    draw_primary_button(&mut pm, pri_rect, sf, hovered == Some(HitKind::UpdatePrimary), snap.busy);
+                    draw_primary_button(&mut pm, pri_rect, sf, hovered == Some(HitKind::UpdatePrimary), snap.busy, &p);
                     texts.push((snap.primary_button_label(), pri_rect, (255, 255, 255), FontSlot::BodyBold, DT_CENTER.0));
 
                     // Status text next to primary button
@@ -1495,10 +1750,10 @@ impl SettingsWindow {
                         snap.status.clone(),
                         RectI::new(pri_rect.right + s(14), hero.top + s(56), hero.right - s(16), hero.top + s(88)),
                         match snap.phase {
-                            UpdatePhase::Error => (251, 113, 133),
-                            UpdatePhase::Downloaded | UpdatePhase::Current => (52, 211, 153),
-                            UpdatePhase::Available | UpdatePhase::Downloading | UpdatePhase::Verifying => (125, 211, 252),
-                            _ => (148, 163, 184),
+                            UpdatePhase::Error => p.text_danger,
+                            UpdatePhase::Downloaded | UpdatePhase::Current => p.text_success,
+                            UpdatePhase::Available | UpdatePhase::Downloading | UpdatePhase::Verifying => p.text_accent,
+                            _ => p.text_secondary,
                         },
                         FontSlot::Small,
                         DT_LEFT.0 | DT_END_ELLIPSIS.0,
@@ -1509,7 +1764,7 @@ impl SettingsWindow {
                     let bar_t = (hero.top + s(106)) as f32;
                     let bar_w = (hero.width() - s(32)) as f32;
                     let bar_h = 8.0 * sf;
-                    fill_rrect(&mut pm, bar_l, bar_t, bar_w, bar_h, bar_h * 0.5, Color::from_rgba8(15, 23, 42, 255));
+                    fill_rrect(&mut pm, bar_l, bar_t, bar_w, bar_h, bar_h * 0.5, p.progress_track);
                     let ratio = if snap.pending_restart {
                         1.0
                     } else if snap.busy && snap.progress == 0 {
@@ -1519,13 +1774,13 @@ impl SettingsWindow {
                     };
                     if ratio > 0.0 {
                         let fw = (bar_w * ratio).max(bar_h * 1.5);
-                        if let Some(p) = rrect_path(bar_l, bar_t, fw, bar_h, bar_h * 0.5) {
+                        if let Some(bp) = rrect_path(bar_l, bar_t, fw, bar_h, bar_h * 0.5) {
                             if let Some(g) = LinearGradient::new(
                                 Point::from_xy(bar_l, bar_t),
                                 Point::from_xy(bar_l + fw, bar_t),
                                 vec![
                                     GradientStop::new(0.0, Color::from_rgba8(14, 165, 233, 255)),
-                                    GradientStop::new(1.0, Color::from_rgba8(52, 211, 153, 255)),
+                                    GradientStop::new(1.0, Color::from_rgba8(16, 185, 129, 255)),
                                 ],
                                 SpreadMode::Pad,
                                 Transform::identity(),
@@ -1533,7 +1788,7 @@ impl SettingsWindow {
                                 let mut paint = Paint::default();
                                 paint.shader = g;
                                 paint.anti_alias = true;
-                                pm.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
+                                pm.fill_path(&bp, &paint, FillRule::Winding, Transform::identity(), None);
                             }
                         }
                     }
@@ -1545,20 +1800,20 @@ impl SettingsWindow {
                     texts.push((
                         hint_line,
                         RectI::new(hero.left + s(16), hero.top + s(118), hero.right - s(16), hero.bottom - s(4)),
-                        (100, 116, 139),
+                        p.text_muted,
                         FontSlot::Small,
                         DT_LEFT.0 | DT_END_ELLIPSIS.0,
                     ));
 
                     // --- Mirror & Proxy Config Card ---
                     let src_card = RectI::new(content_x, s(218), content_r, s(398));
-                    draw_card(&mut pm, src_card, 11.0 * sf, sf, Color::from_rgba8(22, 32, 50, 255));
+                    draw_card(&mut pm, src_card, 11.0 * sf, sf, p.card_bg, &p);
 
                     // Row 1: Preferred source segmented bar + auto-check toggle
                     texts.push((
                         "首选源".into(),
                         RectI::new(src_card.left + s(16), s(228), src_card.left + s(90), s(258)),
-                        (203, 213, 225),
+                        p.text_body,
                         FontSlot::BodyBold,
                         DT_LEFT.0,
                     ));
@@ -1573,6 +1828,7 @@ impl SettingsWindow {
                         cfg.update.preferred_source.index(),
                         hovered,
                         HitKind::UpdateSourceSeg,
+                        &p,
                     );
 
                     let auto_rect = RectI::new(src_card.right - s(172), s(228), src_card.right - s(14), s(258));
@@ -1580,31 +1836,31 @@ impl SettingsWindow {
                     texts.push((
                         "启动自动检查".into(),
                         RectI::new(auto_rect.left, auto_rect.top, auto_rect.right - s(48), auto_rect.bottom),
-                        (148, 163, 184),
+                        p.text_secondary,
                         FontSlot::Small,
                         DT_RIGHT.0,
                     ));
-                    draw_toggle_switch(&mut pm, (auto_rect.right - s(42)) as f32, (auto_rect.top + s(4)) as f32, sf, cfg.update.auto_check_on_start);
+                    draw_toggle_switch(&mut pm, (auto_rect.right - s(42)) as f32, (auto_rect.top + s(4)) as f32, sf, cfg.update.auto_check_on_start, &p);
 
                     // Row 2: CNB URL
                     texts.push((
                         "CNB 地址".into(),
                         RectI::new(src_card.left + s(16), s(272), src_card.left + s(92), s(302)),
-                        (203, 213, 225),
+                        p.text_body,
                         FontSlot::Body,
                         DT_LEFT.0,
                     ));
-                    draw_input_frame(&mut pm, self.cnb_url_box(), sf, focused_edit == Some(ID_EDIT_CNB_URL));
+                    draw_input_frame(&mut pm, self.cnb_url_box(), sf, focused_edit == Some(ID_EDIT_CNB_URL), &p);
 
                     // Row 3: GitHub URL
                     texts.push((
                         "GitHub".into(),
                         RectI::new(src_card.left + s(16), s(312), src_card.left + s(92), s(342)),
-                        (203, 213, 225),
+                        p.text_body,
                         FontSlot::Body,
                         DT_LEFT.0,
                     ));
-                    draw_input_frame(&mut pm, self.github_url_box(), sf, focused_edit == Some(ID_EDIT_GITHUB_URL));
+                    draw_input_frame(&mut pm, self.github_url_box(), sf, focused_edit == Some(ID_EDIT_GITHUB_URL), &p);
 
                     // Row 4: Proxy
                     let p_tog = RectI::new(src_card.left + s(16), s(354), src_card.left + s(126), s(384));
@@ -1612,11 +1868,11 @@ impl SettingsWindow {
                     texts.push((
                         "代理".into(),
                         RectI::new(p_tog.left, p_tog.top, p_tog.left + s(46), p_tog.bottom),
-                        (203, 213, 225),
+                        p.text_body,
                         FontSlot::Body,
                         DT_LEFT.0,
                     ));
-                    draw_toggle_switch(&mut pm, (p_tog.left + s(50)) as f32, (p_tog.top + s(4)) as f32, sf, cfg.update.proxy.enabled);
+                    draw_toggle_switch(&mut pm, (p_tog.left + s(50)) as f32, (p_tog.top + s(4)) as f32, sf, cfg.update.proxy.enabled, &p);
 
                     let proto_seg = RectI::new(src_card.left + s(134), s(355), src_card.left + s(238), s(383));
                     draw_segmented_bar(
@@ -1629,20 +1885,21 @@ impl SettingsWindow {
                         if cfg.update.proxy.protocol == "https" { 1 } else { 0 },
                         hovered,
                         HitKind::ProxyProtoSeg,
+                        &p,
                     );
-                    draw_input_frame(&mut pm, self.proxy_host_box(), sf, focused_edit == Some(ID_EDIT_PROXY_HOST));
-                    draw_input_frame(&mut pm, self.proxy_port_box(), sf, focused_edit == Some(ID_EDIT_PROXY_PORT));
+                    draw_input_frame(&mut pm, self.proxy_host_box(), sf, focused_edit == Some(ID_EDIT_PROXY_HOST), &p);
+                    draw_input_frame(&mut pm, self.proxy_port_box(), sf, focused_edit == Some(ID_EDIT_PROXY_PORT), &p);
 
                     // --- Release Notes Card ---
                     texts.push((
                         "版本更新日志".into(),
                         RectI::new(content_x + s(2), s(410), content_r, s(428)),
-                        (148, 163, 184),
+                        p.text_secondary,
                         FontSlot::Section,
                         DT_LEFT.0,
                     ));
                     let notes_card = RectI::new(content_x, s(432), content_r, h - s(20));
-                    draw_card(&mut pm, notes_card, 11.0 * sf, sf, Color::from_rgba8(14, 22, 39, 255));
+                    draw_card(&mut pm, notes_card, 11.0 * sf, sf, p.card_sub_bg, &p);
                 }
             }
 
@@ -1712,7 +1969,7 @@ impl SettingsWindow {
                     windows::Win32::Graphics::Gdi::HGDIOBJ(self.font_small.0.0),
                 );
                 SetBkMode(surface.dc, TRANSPARENT);
-                SetTextColor(surface.dc, rgb_colorref(203, 213, 225));
+                SetTextColor(surface.dc, rgb_colorref(p.text_body.0, p.text_body.1, p.text_body.2));
                 let _ = DrawTextW(
                     surface.dc,
                     &mut chars,
@@ -1822,7 +2079,19 @@ fn stroke_rrect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, r: f32, width: 
     }
 }
 
-fn draw_card(pm: &mut Pixmap, rect: RectI, radius: f32, sf: f32, bg: Color) {
+fn draw_card(pm: &mut Pixmap, rect: RectI, radius: f32, sf: f32, bg: Color, p: &Palette) {
+    if !p.dark {
+        // Ultra-subtle elevation shadow under white Fluent cards in light mode
+        fill_rrect(
+            pm,
+            rect.left as f32,
+            rect.top as f32 + 1.5 * sf,
+            rect.width() as f32,
+            rect.height() as f32,
+            radius,
+            Color::from_rgba8(15, 23, 42, 10),
+        );
+    }
     fill_rrect(
         pm,
         rect.left as f32,
@@ -1840,22 +2109,22 @@ fn draw_card(pm: &mut Pixmap, rect: RectI, radius: f32, sf: f32, bg: Color) {
         rect.height() as f32 - sf,
         (radius - 0.5 * sf).max(0.0),
         1.0 * sf,
-        Color::from_rgba8(255, 255, 255, 18),
+        p.card_border,
     );
 }
 
-fn draw_divider(pm: &mut Pixmap, x0: i32, y: i32, x1: i32, sf: f32) {
+fn draw_divider(pm: &mut Pixmap, x0: i32, y: i32, x1: i32, sf: f32, p: &Palette) {
     fill_rect(
         pm,
         x0 as f32,
         y as f32,
         (x1 - x0).max(0) as f32,
         (1.0 * sf).max(1.0),
-        Color::from_rgba8(255, 255, 255, 14),
+        p.divider,
     );
 }
 
-fn draw_input_frame(pm: &mut Pixmap, rect: RectI, sf: f32, focused: bool) {
+fn draw_input_frame(pm: &mut Pixmap, rect: RectI, sf: f32, focused: bool, p: &Palette) {
     fill_rrect(
         pm,
         rect.left as f32,
@@ -1863,12 +2132,12 @@ fn draw_input_frame(pm: &mut Pixmap, rect: RectI, sf: f32, focused: bool) {
         rect.width() as f32,
         rect.height() as f32,
         7.0 * sf,
-        Color::from_rgba8(14, 22, 39, 255),
+        p.input_bg,
     );
     let border = if focused {
-        Color::from_rgba8(56, 189, 248, 255)
+        p.input_border_focus
     } else {
-        Color::from_rgba8(42, 56, 82, 255)
+        p.input_border
     };
     stroke_rrect(
         pm,
@@ -1882,14 +2151,14 @@ fn draw_input_frame(pm: &mut Pixmap, rect: RectI, sf: f32, focused: bool) {
     );
 }
 
-fn draw_toggle_switch(pm: &mut Pixmap, x: f32, y: f32, sf: f32, on: bool) {
+fn draw_toggle_switch(pm: &mut Pixmap, x: f32, y: f32, sf: f32, on: bool, p: &Palette) {
     let w = 40.0 * sf;
     let h = 22.0 * sf;
     let r = h * 0.5;
     let track_col = if on {
         Color::from_rgba8(14, 165, 233, 255)
     } else {
-        Color::from_rgba8(51, 65, 85, 255)
+        p.toggle_off_track
     };
     fill_rrect(pm, x, y, w, h, r, track_col);
     if !on {
@@ -1901,23 +2170,23 @@ fn draw_toggle_switch(pm: &mut Pixmap, x: f32, y: f32, sf: f32, on: bool) {
             h - sf,
             r - 0.5 * sf,
             1.0 * sf,
-            Color::from_rgba8(255, 255, 255, 22),
+            p.toggle_off_border,
         );
     }
     let knob_r = 7.5 * sf;
     let cx = if on { x + w - 11.0 * sf } else { x + 11.0 * sf };
     let cy = y + h * 0.5;
     if let Some(sh) = PathBuilder::from_circle(cx, cy + 1.0 * sf, knob_r) {
-        let mut p = Paint::default();
-        p.set_color(Color::from_rgba8(0, 0, 0, 50));
-        p.anti_alias = true;
-        pm.fill_path(&sh, &p, FillRule::Winding, Transform::identity(), None);
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_rgba8(0, 0, 0, if p.dark { 50 } else { 32 }));
+        paint.anti_alias = true;
+        pm.fill_path(&sh, &paint, FillRule::Winding, Transform::identity(), None);
     }
     if let Some(knob) = PathBuilder::from_circle(cx, cy, knob_r) {
-        let mut p = Paint::default();
-        p.set_color(Color::from_rgba8(248, 250, 252, 255));
-        p.anti_alias = true;
-        pm.fill_path(&knob, &p, FillRule::Winding, Transform::identity(), None);
+        let mut paint = Paint::default();
+        paint.set_color(Color::from_rgba8(255, 255, 255, 255));
+        paint.anti_alias = true;
+        pm.fill_path(&knob, &paint, FillRule::Winding, Transform::identity(), None);
     }
 }
 
@@ -1931,6 +2200,7 @@ fn draw_segmented_bar<F>(
     selected: usize,
     hovered: Option<HitKind>,
     make_kind: F,
+    p: &Palette,
 ) where
     F: Fn(usize) -> HitKind,
 {
@@ -1941,7 +2211,7 @@ fn draw_segmented_bar<F>(
         rect.width() as f32,
         rect.height() as f32,
         8.0 * sf,
-        Color::from_rgba8(14, 22, 39, 255),
+        p.seg_bg,
     );
     stroke_rrect(
         pm,
@@ -1951,7 +2221,7 @@ fn draw_segmented_bar<F>(
         rect.height() as f32 - sf,
         7.5 * sf,
         1.0 * sf,
-        Color::from_rgba8(42, 56, 82, 255),
+        p.seg_border,
     );
 
     let n = labels.len().max(1) as i32;
@@ -1982,7 +2252,7 @@ fn draw_segmented_bar<F>(
                 sr.width() as f32,
                 sr.height() as f32,
                 6.0 * sf,
-                Color::from_rgba8(14, 165, 233, 220),
+                p.seg_active_bg,
             );
         } else if is_hov {
             fill_rrect(
@@ -1992,7 +2262,7 @@ fn draw_segmented_bar<F>(
                 sr.width() as f32,
                 sr.height() as f32,
                 6.0 * sf,
-                Color::from_rgba8(255, 255, 255, 16),
+                p.seg_hover_bg,
             );
         }
         texts.push((
@@ -2001,22 +2271,31 @@ fn draw_segmented_bar<F>(
             if active {
                 (255, 255, 255)
             } else if is_hov {
-                (226, 232, 240)
+                p.text_primary
             } else {
-                (148, 163, 184)
+                p.text_secondary
             },
-            if active { FontSlot::Small } else { FontSlot::Small },
+            FontSlot::Small,
             DT_CENTER.0,
         ));
     }
 }
 
-fn draw_primary_button(pm: &mut Pixmap, rect: RectI, sf: f32, hovered: bool, disabled: bool) {
+fn draw_primary_button(
+    pm: &mut Pixmap,
+    rect: RectI,
+    sf: f32,
+    hovered: bool,
+    disabled: bool,
+    p: &Palette,
+) {
     let (c0, c1) = if disabled {
-        (
-            Color::from_rgba8(51, 65, 85, 255),
-            Color::from_rgba8(51, 65, 85, 255),
-        )
+        let dis = if p.dark {
+            Color::from_rgba8(51, 65, 85, 255)
+        } else {
+            Color::from_rgba8(148, 163, 184, 255)
+        };
+        (dis, dis)
     } else if hovered {
         (
             Color::from_rgba8(56, 189, 248, 255),
@@ -2042,26 +2321,33 @@ fn draw_primary_button(pm: &mut Pixmap, rect: RectI, sf: f32, hovered: bool, dis
             SpreadMode::Pad,
             Transform::identity(),
         ) {
-            let mut p = Paint::default();
-            p.shader = grad;
-            p.anti_alias = true;
-            pm.fill_path(&path, &p, FillRule::Winding, Transform::identity(), None);
+            let mut paint = Paint::default();
+            paint.shader = grad;
+            paint.anti_alias = true;
+            pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
         }
     }
 }
 
-fn draw_ghost_button(pm: &mut Pixmap, rect: RectI, sf: f32, hovered: bool, danger: bool) {
+fn draw_ghost_button(
+    pm: &mut Pixmap,
+    rect: RectI,
+    sf: f32,
+    hovered: bool,
+    danger: bool,
+    p: &Palette,
+) {
     let bg = match (hovered, danger) {
-        (true, true) => Color::from_rgba8(244, 63, 94, 46),
-        (true, false) => Color::from_rgba8(42, 56, 82, 255),
-        (false, true) => Color::from_rgba8(244, 63, 94, 18),
-        (false, false) => Color::from_rgba8(28, 40, 62, 255),
+        (true, true) => p.ghost_danger_hover_bg,
+        (true, false) => p.ghost_hover_bg,
+        (false, true) => p.ghost_danger_bg,
+        (false, false) => p.ghost_bg,
     };
     let border = match (hovered, danger) {
-        (true, true) => Color::from_rgba8(244, 63, 94, 140),
-        (true, false) => Color::from_rgba8(100, 116, 139, 140),
-        (false, true) => Color::from_rgba8(244, 63, 94, 60),
-        (false, false) => Color::from_rgba8(255, 255, 255, 24),
+        (true, true) => p.ghost_danger_hover_border,
+        (true, false) => p.ghost_hover_border,
+        (false, true) => p.ghost_danger_border,
+        (false, false) => p.ghost_border,
     };
     fill_rrect(
         pm,
@@ -2196,19 +2482,39 @@ unsafe extern "system" fn settings_wnd_proc(
         }
         WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC => {
             let hdc = HDC(wparam.0 as *mut _);
-            unsafe {
-                SetTextColor(hdc, rgb_colorref(241, 245, 249));
-                SetBkColor(hdc, rgb_colorref(14, 22, 39));
-            }
-            let brush = SETTINGS.with(|cell| {
-                cell.try_borrow()
-                    .ok()
-                    .and_then(|b| b.as_ref().map(|w| w.edit_bg_brush.0.0 as isize))
-                    .unwrap_or(0)
+            let theme_info = SETTINGS.with(|cell| {
+                cell.try_borrow().ok().and_then(|b| {
+                    b.as_ref().map(|w| {
+                        let p = w.palette();
+                        let brush = if p.dark {
+                            w.edit_bg_dark.0.0 as isize
+                        } else {
+                            w.edit_bg_light.0.0 as isize
+                        };
+                        (p.input_text_rgb, p.input_bg_rgb, brush)
+                    })
+                })
             });
-            if brush != 0 {
-                return LRESULT(brush);
+            if let Some((fg, bg, brush)) = theme_info {
+                unsafe {
+                    SetTextColor(hdc, rgb_colorref(fg.0, fg.1, fg.2));
+                    SetBkColor(hdc, rgb_colorref(bg.0, bg.1, bg.2));
+                }
+                if brush != 0 {
+                    return LRESULT(brush);
+                }
             }
+        }
+        0x001A /* WM_SETTINGCHANGE */ => {
+            SETTINGS.with(|cell| {
+                if let Ok(borrow) = cell.try_borrow() {
+                    if let Some(win) = borrow.as_ref() {
+                        if win.cfg.borrow().theme == ThemeMode::System {
+                            win.refresh_theme_surfaces();
+                        }
+                    }
+                }
+            });
         }
         WM_SETCURSOR => {
             let over_interactive = SETTINGS.with(|cell| {
@@ -2429,7 +2735,7 @@ unsafe extern "system" fn settings_wnd_proc(
                 SETTINGS.with(|cell| {
                     if let Ok(borrow) = cell.try_borrow() {
                         if let Some(win) = borrow.as_ref() {
-                            win.request_repaint();
+                            win.request_stats_repaint();
                         }
                     }
                 });
@@ -2509,9 +2815,20 @@ mod visual_tests {
             },
         );
         for tab in 0..3 {
-            let path = out_dir.join(format!("settings-tab{tab}.png"));
-            assert!(capture_settings_snapshot(tab, &path), "failed snapshot tab {tab}");
+            let path = out_dir.join(format!("settings-light-tab{tab}.png"));
+            assert!(capture_settings_snapshot(tab, &path), "failed light snapshot tab {tab}");
         }
+        // Switch live to Dark mode and capture Tab 0 to confirm instant dual-theme switch
+        SETTINGS.with(|cell| {
+            if let Some(win) = cell.borrow().as_ref() {
+                win.cfg.borrow_mut().theme = ThemeMode::Dark;
+                win.refresh_theme_surfaces();
+            }
+        });
+        assert!(
+            capture_settings_snapshot(0, &out_dir.join("settings-dark-tab0.png")),
+            "failed dark snapshot tab 0"
+        );
         close_settings_if_open();
     }
 }

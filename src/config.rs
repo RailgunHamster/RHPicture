@@ -5,6 +5,46 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    Light,
+    System,
+    Dark,
+}
+
+impl Default for ThemeMode {
+    fn default() -> Self {
+        ThemeMode::Light
+    }
+}
+
+impl ThemeMode {
+    pub fn index(self) -> usize {
+        match self {
+            ThemeMode::Light => 0,
+            ThemeMode::System => 1,
+            ThemeMode::Dark => 2,
+        }
+    }
+
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            1 => ThemeMode::System,
+            2 => ThemeMode::Dark,
+            _ => ThemeMode::Light,
+        }
+    }
+
+    pub fn is_dark(self) -> bool {
+        match self {
+            ThemeMode::Light => false,
+            ThemeMode::Dark => true,
+            ThemeMode::System => crate::util::system_prefers_dark_mode(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SaveFormat {
     Png,
     Jpeg,
@@ -207,6 +247,7 @@ impl Default for UpdateConfig {
 #[serde(default, rename_all = "camelCase")]
 pub struct AppConfig {
     pub schema_version: u32,
+    pub theme: ThemeMode,
     pub screenshot_hotkey: String,
     pub pin_clipboard_hotkey: String,
     pub toggle_pins_hotkey: String,
@@ -225,6 +266,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             schema_version: 1,
+            theme: ThemeMode::Light,
             screenshot_hotkey: "F1".into(),
             pin_clipboard_hotkey: "F3".into(),
             toggle_pins_hotkey: "Shift+F3".into(),
@@ -374,5 +416,28 @@ mod tests {
             port: 0,
         };
         assert!(disabled_bad.validate().is_ok());
+    }
+
+    #[test]
+    fn theme_mode_defaults_to_light_and_roundtrips() {
+        let def = AppConfig::default();
+        assert_eq!(def.theme, ThemeMode::Light);
+        assert!(!ThemeMode::Light.is_dark());
+        assert!(ThemeMode::Dark.is_dark());
+
+        for (idx, mode) in [ThemeMode::Light, ThemeMode::System, ThemeMode::Dark]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(mode.index(), idx);
+            assert_eq!(ThemeMode::from_index(idx), mode);
+            let json = serde_json::to_string(&mode).unwrap();
+            let parsed: ThemeMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, mode);
+        }
+
+        // Legacy config JSON without "theme" field must default cleanly to Light
+        let legacy: AppConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.theme, ThemeMode::Light);
     }
 }
