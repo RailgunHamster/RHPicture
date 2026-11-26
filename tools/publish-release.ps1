@@ -219,7 +219,7 @@ if ($BundlePath) {
         $psi.CreateNoWindow = $true
         $psi.RedirectStandardOutput = $true
         $psi.RedirectStandardError = $true
-        foreach ($arg in @('-C', $bare, '-c', 'credential.helper=', '-c', ("credential.helper=$credCmd"), 'push', "https://cnb.cool/$Repository.git", 'refs/heads/main:refs/heads/main', "refs/tags/${tag}:refs/tags/${tag}")) {
+        foreach ($arg in @('-C', $bare, '-c', 'http.proxy=', '-c', 'https.proxy=', '-c', 'credential.helper=', '-c', ("credential.helper=$credCmd"), 'push', "https://cnb.cool/$Repository.git", 'refs/heads/main:refs/heads/main', "refs/tags/${tag}:refs/tags/${tag}")) {
             $psi.ArgumentList.Add($arg)
         }
         $psi.Environment['GIT_TERMINAL_PROMPT'] = '0'
@@ -241,6 +241,7 @@ if ($BundlePath) {
 
 $handler = [Net.Http.HttpClientHandler]::new()
 $handler.AllowAutoRedirect = $false
+$handler.UseProxy = $false
 $client = [Net.Http.HttpClient]::new($handler)
 $client.Timeout = [TimeSpan]::FromMinutes(15)
 $client.DefaultRequestHeaders.UserAgent.ParseAdd('RHPicture-Publisher')
