@@ -20,30 +20,31 @@ use windows::Win32::UI::Controls::{
     WC_TABCONTROLW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetAsyncKeyState, VK_BACK, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_LWIN, VK_MENU,
-    VK_RWIN, VK_SHIFT,
+    EnableWindow, GetAsyncKeyState, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_LWIN,
+    VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CB_ADDSTRING,
-    CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST, CallWindowProcW, CreateWindowExW,
-    DefWindowProcW, DestroyWindow, ES_AUTOHSCROLL, ES_MULTILINE, ES_READONLY, ES_WANTRETURN,
-    GWLP_WNDPROC, GetClientRect, GetSystemMetrics, GetWindowTextLengthW, GetWindowTextW, HMENU,
-    HWND_BOTTOM, IDC_ARROW, KillTimer, LoadCursorW, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN,
-    SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DESTROY, WM_GETFONT, WM_KEYDOWN,
-    WM_KILLFOCUS, WM_NCDESTROY, WM_NOTIFY, WM_SETFOCUS, WM_SETFONT, WM_SYSKEYDOWN, WM_TIMER,
-    WNDCLASSEXW, WNDPROC, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_CLIENTEDGE,
-    WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CB_ADDSTRING,
+    CB_GETCURSEL, CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST, CallWindowProcW, CreateWindowExW,
+    DefWindowProcW, DestroyWindow, EN_CHANGE, EN_KILLFOCUS, ES_AUTOHSCROLL, ES_MULTILINE,
+    ES_READONLY, ES_WANTRETURN, GWLP_WNDPROC, GetClientRect, GetSystemMetrics,
+    GetWindowTextLengthW, GetWindowTextW, HMENU, HWND_BOTTOM, IDC_ARROW, KillTimer, LoadCursorW,
+    RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, SetWindowTextW, ShowWindow, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_GETFONT, WM_KEYDOWN, WM_KILLFOCUS, WM_NCDESTROY, WM_NOTIFY,
+    WM_SETFOCUS, WM_SETFONT, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WNDPROC, WS_BORDER, WS_CAPTION,
+    WS_CHILD, WS_CLIPSIBLINGS, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
+    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::PCWSTR;
 
 const SETTINGS_CLASS: &str = "RHPictureSettingsClass";
 const TIMER_STATS: usize = 10;
+const TIMER_AUTOSAVE: usize = 11;
 
 // Control IDs
 const ID_TAB: usize = 100;
-const ID_BTN_SAVE: usize = 101;
 const ID_BTN_CLOSE: usize = 102;
 const ID_LBL_FOOTER: usize = 103;
 
@@ -97,6 +98,8 @@ struct SettingsWindow {
     hwnd: HWND,
     tab_ctrl: HWND,
     active_tab: Cell<usize>,
+    ready: Cell<bool>,
+    pending_autosave: Cell<bool>,
     tab_controls: [Vec<HWND>; 3],
     controls: ControlHandles,
     font_ui: OwnedFont,
@@ -247,6 +250,8 @@ pub fn open_settings(
         hwnd,
         tab_ctrl: HWND::default(),
         active_tab: Cell::new(initial_tab.unwrap_or(0).min(2)),
+        ready: Cell::new(false),
+        pending_autosave: Cell::new(false),
         tab_controls: [Vec::new(), Vec::new(), Vec::new()],
         controls: ControlHandles::default(),
         font_ui,
@@ -274,6 +279,7 @@ pub fn open_settings(
     win.switch_tab(init_tab);
     win.refresh_memory_stats();
     win.refresh_update_ui();
+    win.ready.set(true);
 
     SETTINGS.with(|cell| {
         *cell.borrow_mut() = Some(win);
@@ -439,31 +445,19 @@ impl SettingsWindow {
             }
         }
 
-        // Footer bar
+        // Footer bar (all changes auto-save immediately)
         let fy = ch - footer_h;
         self.controls.footer_lbl = self.create_child(
             "STATIC",
-            "修改设置后点击「保存设置」生效",
+            "修改设置将自动保存并立即生效",
             (WS_CHILD | WS_VISIBLE).0,
             0,
             pad,
             fy + s(11),
-            cw - pad * 2 - s(195),
+            cw - pad * 2 - s(100),
             s(22),
             ID_LBL_FOOTER,
             false,
-        );
-        self.create_child(
-            "BUTTON",
-            "保存设置",
-            (WS_CHILD | WS_VISIBLE | WS_TABSTOP).0 | BS_DEFPUSHBUTTON as u32,
-            0,
-            cw - pad - s(185),
-            fy + s(6),
-            s(88),
-            s(30),
-            ID_BTN_SAVE,
-            true,
         );
         self.create_child(
             "BUTTON",
@@ -1316,16 +1310,37 @@ impl SettingsWindow {
         Ok(cfg)
     }
 
-    fn save_config(&self) -> bool {
+    fn schedule_autosave(&self) {
+        if !self.ready.get() {
+            return;
+        }
+        self.pending_autosave.set(true);
+        unsafe {
+            let _ = SetTimer(Some(self.hwnd), TIMER_AUTOSAVE, 450, None);
+        }
+    }
+
+    fn flush_pending_autosave(&self) {
+        if self.pending_autosave.get() {
+            let _ = self.save_config(true);
+        }
+    }
+
+    fn save_config(&self, quiet_invalid: bool) -> bool {
+        self.pending_autosave.set(false);
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_AUTOSAVE);
+        }
         let cfg = match self.collect_config() {
             Ok(c) => c,
             Err(err) => {
-                set_text(self.controls.footer_lbl, &format!("错误：{err}"));
+                let prefix = if quiet_invalid { "等待完善输入：" } else { "错误：" };
+                set_text(self.controls.footer_lbl, &format!("{prefix}{err}"));
                 return false;
             }
         };
         if let Err(err) = cfg.save() {
-            set_text(self.controls.footer_lbl, &format!("保存失败：{err}"));
+            set_text(self.controls.footer_lbl, &format!("自动保存失败：{err}"));
             return false;
         }
         if let Err(err) = set_auto_start(cfg.auto_start) {
@@ -1335,7 +1350,7 @@ impl SettingsWindow {
         self.updater.update_config(cfg.update.clone());
         let warnings = (self.callbacks.on_config_saved)(cfg);
         if warnings.is_empty() {
-            set_text(self.controls.footer_lbl, "设置已保存并立即生效");
+            set_text(self.controls.footer_lbl, "已自动保存并立即生效");
         } else {
             set_text(self.controls.footer_lbl, &warnings.join("；"));
         }
@@ -1358,7 +1373,7 @@ unsafe extern "system" fn hotkey_edit_proc(
             SETTINGS.with(|cell| {
                 if let Some(win) = cell.borrow().as_ref() {
                     (win.callbacks.on_suspend_hotkeys)(true);
-                    set_text(win.controls.footer_lbl, "请直接按下要绑定的组合键（Backspace 清空）");
+                    set_text(win.controls.footer_lbl, "请直接按下要绑定的组合键（Backspace 清空，Esc 退出）");
                 }
             });
         }
@@ -1372,10 +1387,27 @@ unsafe extern "system" fn hotkey_edit_proc(
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             let vk = wparam.0 as u32;
             if vk == VK_ESCAPE.0 as u32 {
+                let parent = SETTINGS.with(|cell| cell.borrow().as_ref().map(|w| w.hwnd));
+                if let Some(p) = parent {
+                    unsafe {
+                        let _ = SetFocus(Some(p));
+                    }
+                }
                 return LRESULT(0);
             }
             if vk == VK_BACK.0 as u32 || vk == VK_DELETE.0 as u32 {
                 set_text(hwnd, "无");
+                let parent = SETTINGS.with(|cell| {
+                    let borrow = cell.borrow();
+                    let win = borrow.as_ref()?;
+                    win.save_config(false);
+                    Some(win.hwnd)
+                });
+                if let Some(p) = parent {
+                    unsafe {
+                        let _ = SetFocus(Some(p));
+                    }
+                }
                 return LRESULT(0);
             }
             if HotkeySpec::is_modifier_only_vk(vk) {
@@ -1397,6 +1429,17 @@ unsafe extern "system" fn hotkey_edit_proc(
                 }
                 let spec = HotkeySpec { modifiers: mods, vk };
                 set_text(hwnd, &spec.format());
+                let parent = SETTINGS.with(|cell| {
+                    let borrow = cell.borrow();
+                    let win = borrow.as_ref()?;
+                    win.save_config(false);
+                    Some(win.hwnd)
+                });
+                if let Some(p) = parent {
+                    unsafe {
+                        let _ = SetFocus(Some(p));
+                    }
+                }
             }
             return LRESULT(0);
         }
@@ -1452,6 +1495,7 @@ unsafe extern "system" fn settings_wnd_proc(
             if nmhdr.idFrom == ID_TAB && nmhdr.code == TCN_SELCHANGE {
                 SETTINGS.with(|cell| {
                     if let Some(win) = cell.borrow().as_ref() {
+                        win.flush_pending_autosave();
                         let sel = unsafe { SendMessageW(win.tab_ctrl, TCM_GETCURSEL, None, None).0 };
                         if sel >= 0 {
                             win.switch_tab(sel as usize);
@@ -1468,16 +1512,14 @@ unsafe extern "system" fn settings_wnd_proc(
         }
         WM_COMMAND => {
             let id = (wparam.0 & 0xFFFF) as usize;
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
             match id {
-                ID_BTN_SAVE => {
+                ID_BTN_CLOSE => {
                     SETTINGS.with(|cell| {
                         if let Some(win) = cell.borrow().as_ref() {
-                            win.save_config();
+                            win.flush_pending_autosave();
                         }
                     });
-                    return LRESULT(0);
-                }
-                ID_BTN_CLOSE => {
                     unsafe {
                         let _ = DestroyWindow(hwnd);
                     }
@@ -1487,6 +1529,7 @@ unsafe extern "system" fn settings_wnd_proc(
                     SETTINGS.with(|cell| {
                         if let Some(win) = cell.borrow().as_ref() {
                             set_text(win.controls.hk_shot, "无");
+                            win.save_config(false);
                         }
                     });
                     return LRESULT(0);
@@ -1495,6 +1538,7 @@ unsafe extern "system" fn settings_wnd_proc(
                     SETTINGS.with(|cell| {
                         if let Some(win) = cell.borrow().as_ref() {
                             set_text(win.controls.hk_pin, "无");
+                            win.save_config(false);
                         }
                     });
                     return LRESULT(0);
@@ -1503,8 +1547,59 @@ unsafe extern "system" fn settings_wnd_proc(
                     SETTINGS.with(|cell| {
                         if let Some(win) = cell.borrow().as_ref() {
                             set_text(win.controls.hk_toggle, "无");
+                            win.save_config(false);
                         }
                     });
+                    return LRESULT(0);
+                }
+                ID_CHK_AUTOSTART
+                | ID_CHK_SMART_WIN
+                | ID_CHK_MAGNIFIER
+                | ID_CHK_QUICK_SAVE
+                | ID_CHK_PIN_BORDER
+                | ID_CHK_PROXY
+                | ID_CHK_AUTO_UPDATE
+                    if code == BN_CLICKED =>
+                {
+                    SETTINGS.with(|cell| {
+                        if let Some(win) = cell.borrow().as_ref() {
+                            if win.ready.get() {
+                                win.save_config(false);
+                            }
+                        }
+                    });
+                    return LRESULT(0);
+                }
+                ID_CMB_FORMAT | ID_CMB_PIN_DBLCLK | ID_CMB_UPDATE_SRC | ID_CMB_PROXY_PROTO
+                    if code == CBN_SELCHANGE =>
+                {
+                    SETTINGS.with(|cell| {
+                        if let Some(win) = cell.borrow().as_ref() {
+                            if win.ready.get() {
+                                win.save_config(false);
+                            }
+                        }
+                    });
+                    return LRESULT(0);
+                }
+                ID_EDIT_SAVE_DIR
+                | ID_EDIT_CNB_URL
+                | ID_EDIT_GITHUB_URL
+                | ID_EDIT_PROXY_HOST
+                | ID_EDIT_PROXY_PORT => {
+                    if code == EN_CHANGE {
+                        SETTINGS.with(|cell| {
+                            if let Some(win) = cell.borrow().as_ref() {
+                                win.schedule_autosave();
+                            }
+                        });
+                    } else if code == EN_KILLFOCUS {
+                        SETTINGS.with(|cell| {
+                            if let Some(win) = cell.borrow().as_ref() {
+                                win.flush_pending_autosave();
+                            }
+                        });
+                    }
                     return LRESULT(0);
                 }
                 ID_BTN_BROWSE_DIR => {
@@ -1512,6 +1607,7 @@ unsafe extern "system" fn settings_wnd_proc(
                         SETTINGS.with(|cell| {
                             if let Some(win) = cell.borrow().as_ref() {
                                 set_text(win.controls.save_dir, &dir.to_string_lossy());
+                                win.save_config(false);
                             }
                         });
                     }
@@ -1548,7 +1644,7 @@ unsafe extern "system" fn settings_wnd_proc(
                     let action = SETTINGS.with(|cell| {
                         let borrow = cell.borrow();
                         let win = borrow.as_ref()?;
-                        if !win.save_config() {
+                        if !win.save_config(false) {
                             return None;
                         }
                         Some((win.updater.clone(), win.callbacks.on_exit_for_update.clone()))
@@ -1562,7 +1658,7 @@ unsafe extern "system" fn settings_wnd_proc(
                     let updater = SETTINGS.with(|cell| {
                         let borrow = cell.borrow();
                         let win = borrow.as_ref()?;
-                        if !win.save_config() {
+                        if !win.save_config(false) {
                             return None;
                         }
                         Some(win.updater.clone())
@@ -1592,6 +1688,14 @@ unsafe extern "system" fn settings_wnd_proc(
                 });
                 return LRESULT(0);
             }
+            if wparam.0 == TIMER_AUTOSAVE {
+                SETTINGS.with(|cell| {
+                    if let Some(win) = cell.borrow().as_ref() {
+                        win.save_config(true);
+                    }
+                });
+                return LRESULT(0);
+            }
         }
         WM_GETFONT => {
             let f = SETTINGS.with(|cell| {
@@ -1605,6 +1709,11 @@ unsafe extern "system" fn settings_wnd_proc(
             }
         }
         WM_CLOSE => {
+            SETTINGS.with(|cell| {
+                if let Some(win) = cell.borrow().as_ref() {
+                    win.flush_pending_autosave();
+                }
+            });
             unsafe {
                 let _ = DestroyWindow(hwnd);
             }
@@ -1613,6 +1722,7 @@ unsafe extern "system" fn settings_wnd_proc(
         WM_DESTROY => {
             unsafe {
                 let _ = KillTimer(Some(hwnd), TIMER_STATS);
+                let _ = KillTimer(Some(hwnd), TIMER_AUTOSAVE);
             }
             SETTINGS.with(|cell| {
                 if let Some(win) = cell.borrow().as_ref() {

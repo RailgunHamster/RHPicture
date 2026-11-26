@@ -1,10 +1,11 @@
-use crate::capture::{RectI, ScreenCapture, capture_virtual_screen};
+use crate::capture::{MonitorInfo, RectI, ScreenCapture, capture_virtual_screen};
 use crate::image_ops::BgraImage;
 use crate::util::{
-    DibSurface, OwnedFont, create_ui_font, current_hinstance, rgb_colorref, to_wide,
+    DibSurface, OwnedFont, create_ui_font, current_hinstance, rgb_colorref, scale_dpi, to_wide,
     trim_working_set,
 };
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Once;
 use tiny_skia::{Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -75,8 +76,8 @@ struct OverlayState {
     hwnd: HWND,
     capture: ScreenCapture,
     surface: DibSurface,
-    font_ui: OwnedFont,
-    font_small: OwnedFont,
+    /// Per-DPI cached (ui_10pt, small_9pt) ClearType fonts so mixed-DPI monitors render sharply.
+    fonts: HashMap<u32, (OwnedFont, OwnedFont)>,
     show_magnifier: bool,
     smart_window_detect: bool,
 
@@ -88,6 +89,7 @@ struct OverlayState {
     cursor_pos: (i32, i32),
 
     toolbar_rect: RectI,
+    toolbar_dpi: u32,
     buttons: Vec<ToolbarButton>,
     hovered_button: Option<ToolbarAction>,
 
@@ -138,8 +140,21 @@ pub fn start_screenshot_overlay(
     let origin_y = capture.origin_y;
 
     let surface = DibSurface::new(width, height).ok_or_else(|| "无法创建绘制缓冲".to_string())?;
-    let font_ui = OwnedFont(create_ui_font(96, 10, false));
-    let font_small = OwnedFont(create_ui_font(96, 9, false));
+    let mut fonts = HashMap::new();
+    for m in &capture.monitors {
+        fonts.entry(m.dpi).or_insert_with(|| {
+            (
+                OwnedFont(create_ui_font(m.dpi, 10, false)),
+                OwnedFont(create_ui_font(m.dpi, 9, false)),
+            )
+        });
+    }
+    fonts.entry(96).or_insert_with(|| {
+        (
+            OwnedFont(create_ui_font(96, 10, false)),
+            OwnedFont(create_ui_font(96, 9, false)),
+        )
+    });
 
     let mut pt = windows::Win32::Foundation::POINT::default();
     unsafe {
@@ -154,8 +169,7 @@ pub fn start_screenshot_overlay(
         hwnd: HWND::default(),
         capture,
         surface,
-        font_ui,
-        font_small,
+        fonts,
         show_magnifier,
         smart_window_detect,
         selection: None,
@@ -165,6 +179,7 @@ pub fn start_screenshot_overlay(
         drag_orig_sel: RectI::default(),
         cursor_pos: cursor_local,
         toolbar_rect: RectI::default(),
+        toolbar_dpi: 96,
         buttons: Vec::new(),
         hovered_button: None,
         on_finish: Some(Box::new(on_finish)),
@@ -238,13 +253,29 @@ impl OverlayState {
         )
     }
 
-    fn monitor_for_point(&self, x: i32, y: i32) -> RectI {
+    fn monitor_info_for_point(&self, x: i32, y: i32) -> MonitorInfo {
         self.capture
             .monitors
             .iter()
             .copied()
-            .find(|m| m.contains(x, y))
-            .unwrap_or_else(|| self.bounds())
+            .find(|m| m.rect.contains(x, y))
+            .unwrap_or_else(|| MonitorInfo {
+                rect: self.bounds(),
+                dpi: 96,
+            })
+    }
+
+    fn monitor_for_point(&self, x: i32, y: i32) -> RectI {
+        self.monitor_info_for_point(x, y).rect
+    }
+
+    fn font_for_dpi(&self, dpi: u32, small: bool) -> windows::Win32::Graphics::Gdi::HFONT {
+        let pair = self
+            .fonts
+            .get(&dpi)
+            .or_else(|| self.fonts.get(&96))
+            .expect("96 DPI fallback font always exists");
+        if small { pair.1.0 } else { pair.0.0 }
     }
 
     fn update_hover_rect(&mut self) {
@@ -269,7 +300,8 @@ impl OverlayState {
         let Some(sel) = self.selection else {
             return DragMode::None;
         };
-        let tol = 7;
+        let dpi = self.monitor_info_for_point(x, y).dpi;
+        let tol = scale_dpi(8, dpi).max(7);
         let near_l = (x - sel.left).abs() <= tol && y >= sel.top - tol && y <= sel.bottom + tol;
         let near_r = (x - sel.right).abs() <= tol && y >= sel.top - tol && y <= sel.bottom + tol;
         let near_t = (y - sel.top).abs() <= tol && x >= sel.left - tol && x <= sel.right + tol;
@@ -299,10 +331,17 @@ impl OverlayState {
             return;
         }
 
-        let btn_w = 72;
-        let btn_h = 32;
-        let gap = 4;
-        let pad = 6;
+        let mon_info =
+            self.monitor_info_for_point((sel.left + sel.right) / 2, (sel.top + sel.bottom) / 2);
+        let mon = mon_info.rect;
+        let dpi = mon_info.dpi;
+        self.toolbar_dpi = dpi;
+        let s = |v: i32| scale_dpi(v, dpi);
+
+        let btn_w = s(78);
+        let btn_h = s(34);
+        let gap = s(5);
+        let pad = s(6);
         let items = [
             (ToolbarAction::Pin, "贴图"),
             (ToolbarAction::Save, "保存"),
@@ -312,8 +351,7 @@ impl OverlayState {
         let total_w = pad * 2 + (items.len() as i32) * btn_w + ((items.len() as i32) - 1) * gap;
         let total_h = pad * 2 + btn_h;
 
-        let mon = self.monitor_for_point((sel.left + sel.right) / 2, (sel.top + sel.bottom) / 2);
-        let margin = 8;
+        let margin = s(10);
 
         let mut tx = sel.right - total_w;
         if tx < mon.left + margin {
@@ -385,20 +423,24 @@ impl OverlayState {
             }
         }
 
-        // 2. Draw border & handles
+        // 2. Draw border & handles (per-monitor DPI scaled)
         if let Some(r) = active_rect {
             let r = r.intersect(self.bounds());
             if !r.is_empty() {
+                let dpi = self.monitor_info_for_point((r.left + r.right) / 2, (r.top + r.bottom) / 2).dpi;
+                let s = |v: i32| scale_dpi(v, dpi);
                 let is_confirmed = self.selection.is_some();
                 let color = if is_confirmed {
                     [246, 130, 59, 255] // BGRA for #3B82F6
                 } else {
                     [235, 190, 56, 255] // lighter cyan-blue for hover preview
                 };
-                let thickness = if is_confirmed { 2 } else { 3 };
+                let thickness = if is_confirmed { s(2).max(2) } else { s(3).max(2) };
                 self.draw_rect_outline(r, thickness, color);
 
                 if is_confirmed && self.drag_mode == DragMode::None {
+                    let outer = s(4).max(4);
+                    let inner = s(2).max(2);
                     let mx = (r.left + r.right) / 2;
                     let my = (r.top + r.bottom) / 2;
                     let pts = [
@@ -413,11 +455,11 @@ impl OverlayState {
                     ];
                     for (hx, hy) in pts {
                         self.fill_rect_solid(
-                            RectI::new(hx - 4, hy - 4, hx + 5, hy + 5),
+                            RectI::new(hx - outer, hy - outer, hx + outer + 1, hy + outer + 1),
                             [246, 130, 59, 255],
                         );
                         self.fill_rect_solid(
-                            RectI::new(hx - 2, hy - 2, hx + 3, hy + 3),
+                            RectI::new(hx - inner, hy - inner, hx + inner + 1, hy + inner + 1),
                             [255, 255, 255, 255],
                         );
                     }
@@ -538,6 +580,7 @@ impl OverlayState {
         text: &str,
         rect: RectI,
         color: (u8, u8, u8),
+        dpi: u32,
         small: bool,
         centered: bool,
     ) {
@@ -549,11 +592,7 @@ impl OverlayState {
             bottom: rect.bottom,
         };
         unsafe {
-            let font = if small {
-                self.font_small.0
-            } else {
-                self.font_ui.0
-            };
+            let font = self.font_for_dpi(dpi, small);
             let old = SelectObject(self.surface.dc, windows::Win32::Graphics::Gdi::HGDIOBJ(font.0));
             SetBkMode(self.surface.dc, TRANSPARENT);
             SetTextColor(self.surface.dc, rgb_colorref(color.0, color.1, color.2));
@@ -573,15 +612,24 @@ impl OverlayState {
     }
 
     fn draw_size_badge(&mut self, sel: RectI) {
+        let mon_info = self.monitor_info_for_point(sel.left, sel.top);
+        let mon = mon_info.rect;
+        let dpi = mon_info.dpi;
+        let s = |v: i32| scale_dpi(v, dpi);
+        let sf = dpi as f32 / 96.0;
+
         let text = format!("{} × {}", sel.width(), sel.height());
-        let badge_w = 96.max((text.len() as i32) * 8 + 16);
-        let badge_h = 24;
-        let mon = self.monitor_for_point(sel.left, sel.top);
-        let bx = sel.left.clamp(mon.left + 4, (mon.right - badge_w - 4).max(mon.left + 4));
-        let by = if sel.top - badge_h - 6 >= mon.top + 4 {
-            sel.top - badge_h - 6
+        let badge_w = s(98).max(s((text.chars().count() as i32) * 8 + 20));
+        let badge_h = s(26);
+        let pad_edge = s(4);
+        let gap = s(6);
+        let bx = sel
+            .left
+            .clamp(mon.left + pad_edge, (mon.right - badge_w - pad_edge).max(mon.left + pad_edge));
+        let by = if sel.top - badge_h - gap >= mon.top + pad_edge {
+            sel.top - badge_h - gap
         } else {
-            sel.top + 6
+            sel.top + gap
         };
 
         if let Some(mut pm) = Pixmap::new(badge_w as u32, badge_h as u32) {
@@ -591,8 +639,8 @@ impl OverlayState {
                 0.0,
                 badge_w as f32,
                 badge_h as f32,
-                6.0,
-                Color::from_rgba8(20, 24, 33, 224),
+                6.0 * sf,
+                Color::from_rgba8(20, 24, 33, 228),
             );
             self.composite_pixmap(bx, by, &pm);
         }
@@ -600,6 +648,7 @@ impl OverlayState {
             &text,
             RectI::new(bx, by, bx + badge_w, by + badge_h),
             (248, 250, 252),
+            dpi,
             true,
             true,
         );
@@ -612,6 +661,9 @@ impl OverlayState {
         if tw <= 0 || th <= 0 {
             return;
         }
+        let dpi = self.toolbar_dpi;
+        let sf = dpi as f32 / 96.0;
+        let s = |v: i32| scale_dpi(v, dpi);
         let Some(mut pm) = Pixmap::new(tw as u32, th as u32) else {
             return;
         };
@@ -623,17 +675,17 @@ impl OverlayState {
             0.0,
             tw as f32,
             th as f32,
-            9.0,
+            9.0 * sf,
             Color::from_rgba8(24, 28, 38, 242),
         );
         stroke_rounded_rect(
             &mut pm,
-            0.5,
-            0.5,
-            tw as f32 - 1.0,
-            th as f32 - 1.0,
-            8.5,
-            1.0,
+            0.5 * sf,
+            0.5 * sf,
+            tw as f32 - sf,
+            th as f32 - sf,
+            8.5 * sf,
+            1.0 * sf,
             Color::from_rgba8(255, 255, 255, 36),
         );
 
@@ -652,52 +704,59 @@ impl OverlayState {
                 _ => None,
             };
             if let Some(c) = bg {
-                fill_rounded_rect(&mut pm, lx, ly, bw, bh, 6.0, c);
+                fill_rounded_rect(&mut pm, lx, ly, bw, bh, 6.0 * sf, c);
             }
 
-            // Draw crisp vector icon on left of button
-            let ix = lx + 10.0;
-            let iy = ly + (bh - 14.0) * 0.5;
-            draw_toolbar_icon(&mut pm, btn.action, ix, iy);
+            // Draw crisp DPI-scaled vector icon on left of button
+            let ix = lx + 10.0 * sf;
+            let iy = ly + (bh - 14.0 * sf) * 0.5;
+            draw_toolbar_icon(&mut pm, btn.action, ix, iy, sf);
         }
 
         self.composite_pixmap(tb.left, tb.top, &pm);
 
-        // Draw crisp labels via GDI ClearType
+        // Draw crisp labels via GDI ClearType at the monitor's exact DPI
         for btn in &self.buttons {
             let text_rect = RectI::new(
-                btn.rect.left + 26,
+                btn.rect.left + s(26),
                 btn.rect.top,
-                btn.rect.right - 6,
+                btn.rect.right - s(6),
                 btn.rect.bottom,
             );
-            self.draw_text_on_surface(btn.label, text_rect, (248, 250, 252), false, true);
+            self.draw_text_on_surface(btn.label, text_rect, (248, 250, 252), dpi, false, true);
         }
     }
 
     fn draw_magnifier(&mut self) {
         let (cx, cy) = self.cursor_pos;
+        let mon_info = self.monitor_info_for_point(cx, cy);
+        let mon = mon_info.rect;
+        let dpi = mon_info.dpi;
+        let s = |v: i32| scale_dpi(v, dpi);
+
         let sample_w = 17;
         let sample_h = 11;
-        let zoom = 8;
+        let zoom = s(9).max(8);
         let view_w = sample_w * zoom;
         let view_h = sample_h * zoom;
-        let info_h = 44;
-        let pad = 2;
-        let total_w = view_w + pad * 2;
+        let info_h = s(48);
+        let pad = s(2).max(2);
+        let total_w = view_w.max(s(176)) + pad * 2;
         let total_h = view_h + info_h + pad * 2;
+        let view_left_off = (total_w - view_w) / 2;
 
-        let mon = self.monitor_for_point(cx, cy);
-        let mut mx = cx + 22;
-        let mut my = cy + 22;
-        if mx + total_w > mon.right - 8 {
-            mx = cx - 22 - total_w;
+        let offset = s(22);
+        let edge_pad = s(8);
+        let mut mx = cx + offset;
+        let mut my = cy + offset;
+        if mx + total_w > mon.right - edge_pad {
+            mx = cx - offset - total_w;
         }
-        if my + total_h > mon.bottom - 8 {
-            my = cy - 22 - total_h;
+        if my + total_h > mon.bottom - edge_pad {
+            my = cy - offset - total_h;
         }
-        mx = mx.clamp(mon.left + 4, (mon.right - total_w - 4).max(mon.left + 4));
-        my = my.clamp(mon.top + 4, (mon.bottom - total_h - 4).max(mon.top + 4));
+        mx = mx.clamp(mon.left + s(4), (mon.right - total_w - s(4)).max(mon.left + s(4)));
+        my = my.clamp(mon.top + s(4), (mon.bottom - total_h - s(4)).max(mon.top + s(4)));
 
         // Frame background
         self.fill_rect_solid(
@@ -710,6 +769,8 @@ impl OverlayState {
         let half_y = sample_h / 2;
         let img_w = self.capture.image.width as i32;
         let img_h = self.capture.image.height as i32;
+        let vx0 = mx + view_left_off;
+        let vy0 = my + pad;
         for sy_off in 0..sample_h {
             for sx_off in 0..sample_w {
                 let px = cx - half_x + sx_off;
@@ -721,57 +782,78 @@ impl OverlayState {
                 } else {
                     [20, 20, 20, 255]
                 };
-                let dx = mx + pad + sx_off * zoom;
-                let dy = my + pad + sy_off * zoom;
+                let dx = vx0 + sx_off * zoom;
+                let dy = vy0 + sy_off * zoom;
                 self.fill_rect_solid(RectI::new(dx, dy, dx + zoom, dy + zoom), bgra);
             }
         }
 
         // Crosshair highlighting center pixel
-        let center_x = mx + pad + half_x * zoom;
-        let center_y = my + pad + half_y * zoom;
+        let center_x = vx0 + half_x * zoom;
+        let center_y = vy0 + half_y * zoom;
+        let cross_w = s(1).max(1);
         let accent = [246, 130, 59, 255];
         self.fill_rect_solid(
-            RectI::new(mx + pad, center_y + zoom / 2, mx + pad + view_w, center_y + zoom / 2 + 1),
-            [246, 130, 59, 255],
+            RectI::new(vx0, center_y + zoom / 2, vx0 + view_w, center_y + zoom / 2 + cross_w),
+            accent,
         );
         self.fill_rect_solid(
-            RectI::new(center_x + zoom / 2, my + pad, center_x + zoom / 2 + 1, my + pad + view_h),
-            [246, 130, 59, 255],
+            RectI::new(center_x + zoom / 2, vy0, center_x + zoom / 2 + cross_w, vy0 + view_h),
+            accent,
         );
+        let border_w = s(1).max(1);
         self.draw_rect_outline(
-            RectI::new(center_x - 1, center_y - 1, center_x + zoom + 1, center_y + zoom + 1),
-            1,
+            RectI::new(
+                center_x - border_w,
+                center_y - border_w,
+                center_x + zoom + border_w,
+                center_y + zoom + border_w,
+            ),
+            border_w,
             [255, 255, 255, 255],
         );
         self.draw_rect_outline(
             RectI::new(mx, my, mx + total_w, my + total_h),
-            1,
+            border_w,
             accent,
         );
 
         let (r, g, b) = self.capture.image.pixel_rgb(cx, cy).unwrap_or((0, 0, 0));
+        let info_top = vy0 + view_h;
+        let swatch_sz = s(14);
         let swatch = RectI::new(
-            mx + 8,
-            my + pad + view_h + 7,
-            mx + 22,
-            my + pad + view_h + 21,
+            mx + s(8),
+            info_top + s(6),
+            mx + s(8) + swatch_sz,
+            info_top + s(6) + swatch_sz,
         );
         self.fill_rect_solid(swatch, [b, g, r, 255]);
-        self.draw_rect_outline(swatch, 1, [220, 220, 220, 255]);
+        self.draw_rect_outline(swatch, border_w, [220, 220, 220, 255]);
 
         let hex_line = format!("#{:02X}{:02X}{:02X}  ({},{})", r, g, b, cx, cy);
         self.draw_text_on_surface(
             &hex_line,
-            RectI::new(mx + 28, my + pad + view_h + 4, mx + total_w - 4, my + pad + view_h + 22),
+            RectI::new(
+                mx + s(14) + swatch_sz,
+                info_top + s(3),
+                mx + total_w - s(6),
+                info_top + s(24),
+            ),
             (241, 245, 249),
+            dpi,
             true,
             false,
         );
         self.draw_text_on_surface(
             "按 C 复制色值  |  右键取消",
-            RectI::new(mx + 8, my + pad + view_h + 22, mx + total_w - 4, my + total_h - 4),
+            RectI::new(
+                mx + s(8),
+                info_top + s(24),
+                mx + total_w - s(6),
+                my + total_h - s(4),
+            ),
             (148, 163, 184),
+            dpi,
             true,
             false,
         );
@@ -885,7 +967,7 @@ fn rounded_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia
     pb.finish()
 }
 
-fn draw_toolbar_icon(pm: &mut Pixmap, action: ToolbarAction, x: f32, y: f32) {
+fn draw_toolbar_icon(pm: &mut Pixmap, action: ToolbarAction, x: f32, y: f32, scale: f32) {
     let mut paint = Paint::default();
     paint.set_color(Color::from_rgba8(248, 250, 252, 255));
     paint.anti_alias = true;
@@ -899,45 +981,46 @@ fn draw_toolbar_icon(pm: &mut Pixmap, action: ToolbarAction, x: f32, y: f32) {
     let mut pb = PathBuilder::new();
     match action {
         ToolbarAction::Pin => {
-            // Simple pushpin icon
-            pb.move_to(x + 4.0, y + 2.0);
-            pb.line_to(x + 10.0, y + 2.0);
-            pb.line_to(x + 9.0, y + 6.5);
-            pb.line_to(x + 11.5, y + 8.5);
-            pb.line_to(x + 2.5, y + 8.5);
-            pb.line_to(x + 5.0, y + 6.5);
+            // Simple pushpin icon (14x14 logical units)
+            pb.move_to(4.0, 2.0);
+            pb.line_to(10.0, 2.0);
+            pb.line_to(9.0, 6.5);
+            pb.line_to(11.5, 8.5);
+            pb.line_to(2.5, 8.5);
+            pb.line_to(5.0, 6.5);
             pb.close();
-            pb.move_to(x + 7.0, y + 8.5);
-            pb.line_to(x + 7.0, y + 13.0);
+            pb.move_to(7.0, 8.5);
+            pb.line_to(7.0, 13.0);
         }
         ToolbarAction::Save => {
             // Down-arrow into tray
-            pb.move_to(x + 7.0, y + 1.5);
-            pb.line_to(x + 7.0, y + 9.5);
-            pb.move_to(x + 4.0, y + 6.8);
-            pb.line_to(x + 7.0, y + 9.8);
-            pb.line_to(x + 10.0, y + 6.8);
-            pb.move_to(x + 2.0, y + 10.0);
-            pb.line_to(x + 2.0, y + 12.5);
-            pb.line_to(x + 12.0, y + 12.5);
-            pb.line_to(x + 12.0, y + 10.0);
+            pb.move_to(7.0, 1.5);
+            pb.line_to(7.0, 9.5);
+            pb.move_to(4.0, 6.8);
+            pb.line_to(7.0, 9.8);
+            pb.line_to(10.0, 6.8);
+            pb.move_to(2.0, 10.0);
+            pb.line_to(2.0, 12.5);
+            pb.line_to(12.0, 12.5);
+            pb.line_to(12.0, 10.0);
         }
         ToolbarAction::Copy => {
             // Crisp checkmark
-            pb.move_to(x + 2.0, y + 7.5);
-            pb.line_to(x + 5.5, y + 11.0);
-            pb.line_to(x + 12.2, y + 3.2);
+            pb.move_to(2.0, 7.5);
+            pb.line_to(5.5, 11.0);
+            pb.line_to(12.2, 3.2);
         }
         ToolbarAction::Cancel => {
             // Crisp X
-            pb.move_to(x + 3.0, y + 3.0);
-            pb.line_to(x + 11.0, y + 11.0);
-            pb.move_to(x + 11.0, y + 3.0);
-            pb.line_to(x + 3.0, y + 11.0);
+            pb.move_to(3.0, 3.0);
+            pb.line_to(11.0, 11.0);
+            pb.move_to(11.0, 3.0);
+            pb.line_to(3.0, 11.0);
         }
     }
     if let Some(path) = pb.finish() {
-        pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+        let xf = Transform::from_translate(x, y).pre_scale(scale, scale);
+        pm.stroke_path(&path, &paint, &stroke, xf, None);
     }
 }
 

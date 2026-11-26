@@ -62,11 +62,17 @@ impl RectI {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MonitorInfo {
+    pub rect: RectI,
+    pub dpi: u32,
+}
+
 pub struct ScreenCapture {
     pub origin_x: i32,
     pub origin_y: i32,
     pub image: BgraImage,
-    pub monitors: Vec<RectI>,
+    pub monitors: Vec<MonitorInfo>,
     pub window_rects: Vec<RectI>,
 }
 
@@ -74,19 +80,16 @@ pub struct ScreenCapture {
 pub fn capture_virtual_screen(detect_windows: bool) -> Result<ScreenCapture, String> {
     use crate::util::DibSurface;
     use windows::Win32::Foundation::{HWND, LPARAM, RECT};
-    use windows::core::BOOL;
     use windows::Win32::Graphics::Dwm::{
         DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
     };
-    use windows::Win32::Graphics::Gdi::{
-        BitBlt, CAPTUREBLT, EnumDisplayMonitors, GetDC, GetMonitorInfoW, HDC, HMONITOR,
-        MONITORINFO, ReleaseDC, SRCCOPY,
-    };
+    use windows::Win32::Graphics::Gdi::{BitBlt, CAPTUREBLT, GetDC, ReleaseDC, SRCCOPY};
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetSystemMetrics, GetWindowLongW, GetWindowRect, GWL_EXSTYLE, IsIconic,
         IsWindowVisible, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
         SM_YVIRTUALSCREEN, WS_EX_TOOLWINDOW,
     };
+    use windows::core::BOOL;
 
     unsafe {
         let origin_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -116,7 +119,20 @@ pub fn capture_virtual_screen(detect_windows: bool) -> Result<ScreenCapture, Str
             origin_x,
             origin_y,
             SRCCOPY | CAPTUREBLT,
-        );
+        )
+        .or_else(|_| {
+            BitBlt(
+                surface.dc,
+                0,
+                0,
+                width,
+                height,
+                Some(screen_dc),
+                origin_x,
+                origin_y,
+                SRCCOPY,
+            )
+        });
         let _ = ReleaseDC(None, screen_dc);
         blit_res.map_err(|e| format!("屏幕捕获失败：{e}"))?;
 
@@ -128,50 +144,7 @@ pub fn capture_virtual_screen(detect_windows: bool) -> Result<ScreenCapture, Str
         drop(surface);
 
         let bounds = RectI::new(0, 0, width, height);
-
-        // Enumerate monitors in overlay-local coordinates
-        struct MonCtx {
-            origin_x: i32,
-            origin_y: i32,
-            monitors: Vec<RectI>,
-        }
-        unsafe extern "system" fn enum_mon_proc(
-            hmon: HMONITOR,
-            _hdc: HDC,
-            _rect: *mut RECT,
-            lparam: LPARAM,
-        ) -> BOOL {
-            let ctx = unsafe { &mut *(lparam.0 as *mut MonCtx) };
-            let mut info = MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            if unsafe { GetMonitorInfoW(hmon, &mut info) }.as_bool() {
-                let r = info.rcMonitor;
-                ctx.monitors.push(RectI::new(
-                    r.left - ctx.origin_x,
-                    r.top - ctx.origin_y,
-                    r.right - ctx.origin_x,
-                    r.bottom - ctx.origin_y,
-                ));
-            }
-            BOOL(1)
-        }
-
-        let mut mon_ctx = MonCtx {
-            origin_x,
-            origin_y,
-            monitors: Vec::new(),
-        };
-        let _ = EnumDisplayMonitors(
-            None,
-            None,
-            Some(enum_mon_proc),
-            LPARAM(&mut mon_ctx as *mut MonCtx as isize),
-        );
-        if mon_ctx.monitors.is_empty() {
-            mon_ctx.monitors.push(bounds);
-        }
+        let monitors = enumerate_monitors(origin_x, origin_y, bounds);
 
         // Enumerate visible windows in Z-order (front-to-back) for smart hover detection
         let mut window_rects = Vec::new();
@@ -255,8 +228,113 @@ pub fn capture_virtual_screen(detect_windows: bool) -> Result<ScreenCapture, Str
             origin_x,
             origin_y,
             image,
-            monitors: mon_ctx.monitors,
+            monitors,
             window_rects,
         })
+    }
+}
+
+#[cfg(windows)]
+pub fn enumerate_monitors(origin_x: i32, origin_y: i32, bounds: RectI) -> Vec<MonitorInfo> {
+    use windows::Win32::Foundation::{LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    };
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    use windows::core::BOOL;
+
+    struct MonCtx {
+        origin_x: i32,
+        origin_y: i32,
+        monitors: Vec<MonitorInfo>,
+    }
+
+    unsafe extern "system" fn enum_mon_proc(
+        hmon: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        lparam: LPARAM,
+    ) -> BOOL {
+        let ctx = unsafe { &mut *(lparam.0 as *mut MonCtx) };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(hmon, &mut info) }.as_bool() {
+            let r = info.rcMonitor;
+            let mut dpi_x = 96u32;
+            let mut dpi_y = 96u32;
+            let dpi = if unsafe {
+                GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y)
+            }
+            .is_ok()
+                && dpi_x >= 96
+            {
+                dpi_x
+            } else {
+                96
+            };
+            ctx.monitors.push(MonitorInfo {
+                rect: RectI::new(
+                    r.left - ctx.origin_x,
+                    r.top - ctx.origin_y,
+                    r.right - ctx.origin_x,
+                    r.bottom - ctx.origin_y,
+                ),
+                dpi,
+            });
+        }
+        BOOL(1)
+    }
+
+    let mut mon_ctx = MonCtx {
+        origin_x,
+        origin_y,
+        monitors: Vec::new(),
+    };
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(enum_mon_proc),
+            LPARAM(&mut mon_ctx as *mut MonCtx as isize),
+        );
+    }
+    if mon_ctx.monitors.is_empty() {
+        mon_ctx.monitors.push(MonitorInfo {
+            rect: bounds,
+            dpi: 96,
+        });
+    }
+    mon_ctx.monitors
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enumerates_monitors_with_per_monitor_dpi() {
+        use windows::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+            SM_YVIRTUALSCREEN,
+        };
+        unsafe {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+        let ox = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let oy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        let w = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+        let h = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+        let mons = enumerate_monitors(ox, oy, RectI::new(0, 0, w, h));
+        assert!(!mons.is_empty());
+        for m in &mons {
+            println!("Detected monitor rect={:?} dpi={} ({}%)", m.rect, m.dpi, (m.dpi * 100) / 96);
+            assert!(m.dpi >= 96);
+            assert!(m.rect.width() > 0 && m.rect.height() > 0);
+        }
     }
 }

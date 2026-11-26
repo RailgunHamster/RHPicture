@@ -2,7 +2,7 @@ use crate::config::{AppConfig, PinDoubleClickAction};
 use crate::image_ops::{BgraImage, clipboard};
 use crate::util::{
     DibSurface, OwnedFont, create_ui_font, current_hinstance, rgb_colorref, save_file_dialog,
-    timestamp_filename, to_wide, trim_working_set,
+    scale_dpi, timestamp_filename, to_wide, trim_working_set, window_dpi,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -121,6 +121,7 @@ struct PinWindow {
     drag_start_cursor: (i32, i32),
     drag_start_win: (i32, i32),
     hud_text: Option<String>,
+    hud_dpi: u32,
     font_hud: OwnedFont,
 }
 
@@ -211,6 +212,7 @@ pub fn create_pin(image: BgraImage, screen_x: i32, screen_y: i32) -> Result<u64,
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
     }
 
+    let initial_dpi = window_dpi(hwnd);
     let pin = PinWindow {
         id,
         hwnd,
@@ -227,7 +229,8 @@ pub fn create_pin(image: BgraImage, screen_x: i32, screen_y: i32) -> Result<u64,
         drag_start_cursor: (0, 0),
         drag_start_win: (screen_x, screen_y),
         hud_text: None,
-        font_hud: OwnedFont(create_ui_font(96, 10, true)),
+        hud_dpi: initial_dpi,
+        font_hud: OwnedFont(create_ui_font(initial_dpi, 10, true)),
     };
 
     MANAGER.with(|m| {
@@ -510,19 +513,26 @@ impl PinWindow {
                 }
             }
 
-            // Draw crisp 1px border (accent blue when hovered, subtle neutral otherwise)
+            let dpi = window_dpi(self.hwnd);
+            if dpi != self.hud_dpi {
+                self.hud_dpi = dpi;
+                self.font_hud = OwnedFont(create_ui_font(dpi, 10, true));
+            }
+
+            // Draw crisp DPI-scaled border (accent blue when hovered, subtle neutral otherwise)
             if show_border || self.hovered {
                 let border = if self.hovered {
                     [246u8, 130, 59, 255] // #3B82F6 in BGRA
                 } else {
                     [130u8, 116, 100, 255]
                 };
-                draw_border_1px(surface.pixels_mut(), win_w as usize, win_h as usize, border);
+                let bw = scale_dpi(1, dpi).clamp(1, 3) as usize;
+                draw_border(surface.pixels_mut(), win_w as usize, win_h as usize, bw, border);
             }
 
             // Optional transient HUD pill (zoom / opacity / copied)
             if let Some(ref text) = self.hud_text {
-                draw_hud_pill(&mut surface, self.font_hud.0, text);
+                draw_hud_pill(&mut surface, self.font_hud.0, dpi, text);
             }
 
             unsafe {
@@ -536,32 +546,44 @@ impl PinWindow {
     }
 }
 
-fn draw_border_1px(pixels: &mut [u8], w: usize, h: usize, bgra: [u8; 4]) {
+fn draw_border(pixels: &mut [u8], w: usize, h: usize, thickness: usize, bgra: [u8; 4]) {
     if w < 2 || h < 2 {
         return;
     }
-    for x in 0..w {
-        let top = x * 4;
-        let bot = ((h - 1) * w + x) * 4;
-        pixels[top..top + 4].copy_from_slice(&bgra);
-        pixels[bot..bot + 4].copy_from_slice(&bgra);
-    }
-    for y in 0..h {
-        let left = (y * w) * 4;
-        let right = (y * w + w - 1) * 4;
-        pixels[left..left + 4].copy_from_slice(&bgra);
-        pixels[right..right + 4].copy_from_slice(&bgra);
+    let t = thickness.min(w / 2).min(h / 2).max(1);
+    for b in 0..t {
+        for x in 0..w {
+            let top = (b * w + x) * 4;
+            let bot = ((h - 1 - b) * w + x) * 4;
+            pixels[top..top + 4].copy_from_slice(&bgra);
+            pixels[bot..bot + 4].copy_from_slice(&bgra);
+        }
+        for y in 0..h {
+            let left = (y * w + b) * 4;
+            let right = (y * w + w - 1 - b) * 4;
+            pixels[left..left + 4].copy_from_slice(&bgra);
+            pixels[right..right + 4].copy_from_slice(&bgra);
+        }
     }
 }
 
-fn draw_hud_pill(surface: &mut DibSurface, font: windows::Win32::Graphics::Gdi::HFONT, text: &str) {
-    let pw = ((text.chars().count() as i32) * 10 + 24).clamp(64, (surface.width - 8).max(64));
-    let ph = 28.min((surface.height - 4).max(20));
+fn draw_hud_pill(
+    surface: &mut DibSurface,
+    font: windows::Win32::Graphics::Gdi::HFONT,
+    dpi: u32,
+    text: &str,
+) {
+    let s = |v: i32| scale_dpi(v, dpi);
+    let sf = dpi as f32 / 96.0;
+    let desired_w = s((text.chars().count() as i32) * 11 + 26).max(s(68));
+    let max_w = (surface.width - s(8)).max(24);
+    let pw = desired_w.min(max_w);
+    let ph = s(30).min((surface.height - s(4)).max(20));
     let px = ((surface.width - pw) / 2).max(0);
     let py = ((surface.height - ph) / 2).max(0);
 
     if let Some(mut pm) = Pixmap::new(pw as u32, ph as u32) {
-        let r = 7.0_f32.min(pw as f32 * 0.5).min(ph as f32 * 0.5);
+        let r = (7.0 * sf).min(pw as f32 * 0.5).min(ph as f32 * 0.5);
         let k = 0.5522848 * r;
         let (w, h) = (pw as f32, ph as f32);
         let mut pb = PathBuilder::new();
