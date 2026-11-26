@@ -488,7 +488,7 @@ unsafe extern "system" fn tray_wnd_proc(
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-pub fn run_app(open_settings_on_start: bool) -> Result<(), String> {
+pub fn run_app(open_settings_on_start: bool, post_update: bool) -> Result<(), String> {
     let first_run = !AppConfig::config_path(&crate::config::data_dir()).exists();
     let config = AppConfig::load();
     if first_run {
@@ -558,6 +558,13 @@ pub fn run_app(open_settings_on_start: bool) -> Result<(), String> {
 
     if !warnings.is_empty() {
         show_balloon(hwnd, "快捷键提示", &warnings.join("；"), true);
+    } else if post_update {
+        show_balloon(
+            hwnd,
+            "RHPicture 更新完成",
+            &format!("已升级至 v{}，快捷键与设置已自动保留", crate::updater::APP_VERSION),
+            false,
+        );
     } else if first_run {
         show_balloon(
             hwnd,

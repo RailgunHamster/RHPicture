@@ -1043,9 +1043,36 @@ impl UpdateService {
             s.notify_ui();
         }
 
+        #[cfg(windows)]
+        let transition = velopack::locator::auto_locate_app_manifest(
+            velopack::locator::LocationContext::FromCurrentExe,
+        )
+        .ok()
+        .and_then(|locator| {
+            crate::update_splash::launch(
+                &manager.get_current_version_as_string(),
+                &pending.Version,
+                &locator.get_root_dir(),
+            )
+        });
+        #[cfg(windows)]
+        let silent = transition.is_some();
+        #[cfg(not(windows))]
+        let silent = false;
+
         manager
-            .wait_exit_then_apply_updates(&pending, false, true, Vec::<String>::new())
+            .wait_exit_then_apply_updates(
+                &pending,
+                silent,
+                true,
+                vec!["--post-update".to_string()],
+            )
             .map_err(|e| format!("启动更新安装程序失败：{e}"))?;
+
+        #[cfg(windows)]
+        if let Some(t) = transition {
+            t.commit();
+        }
 
         on_exit();
         Ok(())

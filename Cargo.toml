@@ -1,6 +1,6 @@
 [package]
 name = "rhpicture"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Ultra-lightweight, zero-VRAM Rust screenshot and screen-pinning tool for Windows"
 license = "MIT"
@@ -34,6 +34,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Gdi",
     "Win32_System_Com",
     "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_ProcessStatus",

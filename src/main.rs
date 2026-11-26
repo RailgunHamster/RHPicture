@@ -35,19 +35,27 @@ fn main() {
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
     };
 
-    // Velopack hooks must execute before any application initialization.
-    velopack::VelopackApp::build().run();
-
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
+
+    // Independent update transition splash runs outside the installation root and bypasses Velopack/mutex.
+    if let Some(splash_args) = rhpicture::update_splash::SplashArgs::parse_from_env() {
+        rhpicture::update_splash::run_splash_process(splash_args);
+        return;
+    }
+
+    // Velopack hooks must execute before any application initialization.
+    velopack::VelopackApp::build().run();
+    rhpicture::update_splash::cleanup_stale_transitions();
 
     let Some(mutex) = acquire_single_instance() else {
         return;
     };
 
     let open_settings = std::env::args().any(|a| a == "--settings" || a == "-s");
-    if let Err(err) = rhpicture::tray::run_app(open_settings) {
+    let post_update = std::env::args().any(|a| a == "--post-update");
+    if let Err(err) = rhpicture::tray::run_app(open_settings, post_update) {
         eprintln!("RHPicture error: {err}");
     }
 

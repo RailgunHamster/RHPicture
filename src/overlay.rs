@@ -7,7 +7,10 @@ use crate::util::{
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Once;
-use tiny_skia::{Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{
+    Color, FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Paint, PathBuilder, Pixmap,
+    Point, SpreadMode, Stroke, Transform,
+};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, DT_CENTER, DT_LEFT, DT_NOCLIP, DT_SINGLELINE, DT_VCENTER, DrawTextW,
@@ -338,20 +341,23 @@ impl OverlayState {
         self.toolbar_dpi = dpi;
         let s = |v: i32| scale_dpi(v, dpi);
 
-        let btn_w = s(78);
-        let btn_h = s(34);
+        let btn_w = s(80);
+        let btn_h = s(36);
         let gap = s(5);
-        let pad = s(6);
+        let sep_extra = s(10); // subtle vertical divider before Cancel
+        let pad_x = s(8);
+        let pad_y = s(7);
         let items = [
             (ToolbarAction::Pin, "贴图"),
             (ToolbarAction::Save, "保存"),
             (ToolbarAction::Copy, "复制"),
             (ToolbarAction::Cancel, "取消"),
         ];
-        let total_w = pad * 2 + (items.len() as i32) * btn_w + ((items.len() as i32) - 1) * gap;
-        let total_h = pad * 2 + btn_h;
+        let total_w =
+            pad_x * 2 + (items.len() as i32) * btn_w + ((items.len() as i32) - 1) * gap + sep_extra;
+        let total_h = pad_y * 2 + btn_h;
 
-        let margin = s(10);
+        let margin = s(12);
 
         let mut tx = sel.right - total_w;
         if tx < mon.left + margin {
@@ -371,14 +377,18 @@ impl OverlayState {
         }
 
         self.toolbar_rect = RectI::new(tx, ty, tx + total_w, ty + total_h);
+        let mut bx = tx + pad_x;
         for (i, (action, label)) in items.iter().enumerate() {
-            let bx = tx + pad + (i as i32) * (btn_w + gap);
-            let by = ty + pad;
+            if i == 3 {
+                bx += sep_extra;
+            }
+            let by = ty + pad_y;
             self.buttons.push(ToolbarButton {
                 action: *action,
                 rect: RectI::new(bx, by, bx + btn_w, by + btn_h),
                 label,
             });
+            bx += btn_w + gap;
         }
     }
 
@@ -423,24 +433,48 @@ impl OverlayState {
             }
         }
 
-        // 2. Draw border & handles (per-monitor DPI scaled)
+        // 2. Draw crisp modern border, corner brackets (hover) or circular handles (selected)
         if let Some(r) = active_rect {
             let r = r.intersect(self.bounds());
             if !r.is_empty() {
-                let dpi = self.monitor_info_for_point((r.left + r.right) / 2, (r.top + r.bottom) / 2).dpi;
+                let dpi = self
+                    .monitor_info_for_point((r.left + r.right) / 2, (r.top + r.bottom) / 2)
+                    .dpi;
                 let s = |v: i32| scale_dpi(v, dpi);
+                let sf = dpi as f32 / 96.0;
                 let is_confirmed = self.selection.is_some();
-                let color = if is_confirmed {
-                    [246, 130, 59, 255] // BGRA for #3B82F6
-                } else {
-                    [235, 190, 56, 255] // lighter cyan-blue for hover preview
-                };
-                let thickness = if is_confirmed { s(2).max(2) } else { s(3).max(2) };
-                self.draw_rect_outline(r, thickness, color);
 
-                if is_confirmed && self.drag_mode == DragMode::None {
-                    let outer = s(4).max(4);
-                    let inner = s(2).max(2);
+                // Subtle outer dark contrast rim so border is crystal-clear on pure white backgrounds
+                let halo = s(1).max(1);
+                self.draw_rect_outline(
+                    RectI::new(r.left - halo, r.top - halo, r.right + halo, r.bottom + halo),
+                    halo,
+                    [42, 23, 15, 255],
+                );
+
+                // Luminous sky-cyan border (#38BDF8 in BGRA)
+                let thickness = s(2).max(2);
+                self.draw_rect_outline(r, thickness, [248, 189, 56, 255]);
+
+                if !is_confirmed {
+                    // Modern viewfinder L-corner accents for smart window hover preview
+                    let arm = s(16).min(r.width() / 3).min(r.height() / 3).max(4);
+                    let bt = s(3).max(3);
+                    let bright = [253, 211, 125, 255]; // #7DD3FC in BGRA
+                    // Top-left
+                    self.fill_rect_solid(RectI::new(r.left, r.top, r.left + arm, r.top + bt), bright);
+                    self.fill_rect_solid(RectI::new(r.left, r.top, r.left + bt, r.top + arm), bright);
+                    // Top-right
+                    self.fill_rect_solid(RectI::new(r.right - arm, r.top, r.right, r.top + bt), bright);
+                    self.fill_rect_solid(RectI::new(r.right - bt, r.top, r.right, r.top + arm), bright);
+                    // Bottom-left
+                    self.fill_rect_solid(RectI::new(r.left, r.bottom - bt, r.left + arm, r.bottom), bright);
+                    self.fill_rect_solid(RectI::new(r.left, r.bottom - arm, r.left + bt, r.bottom), bright);
+                    // Bottom-right
+                    self.fill_rect_solid(RectI::new(r.right - arm, r.bottom - bt, r.right, r.bottom), bright);
+                    self.fill_rect_solid(RectI::new(r.right - bt, r.bottom - arm, r.right, r.bottom), bright);
+                } else if self.drag_mode == DragMode::None {
+                    // Anti-aliased floating circular resize handles
                     let mx = (r.left + r.right) / 2;
                     let my = (r.top + r.bottom) / 2;
                     let pts = [
@@ -453,21 +487,23 @@ impl OverlayState {
                         (mx, r.bottom),
                         (r.right, r.bottom),
                     ];
-                    for (hx, hy) in pts {
-                        self.fill_rect_solid(
-                            RectI::new(hx - outer, hy - outer, hx + outer + 1, hy + outer + 1),
-                            [246, 130, 59, 255],
-                        );
-                        self.fill_rect_solid(
-                            RectI::new(hx - inner, hy - inner, hx + inner + 1, hy + inner + 1),
-                            [255, 255, 255, 255],
-                        );
+                    if let Some(handle_pm) = build_circle_handle_pixmap(sf) {
+                        let hw = handle_pm.width() as i32;
+                        let hh = handle_pm.height() as i32;
+                        for (hx, hy) in pts {
+                            self.composite_pixmap(hx - hw / 2, hy - hh / 2, &handle_pm);
+                        }
                     }
                 }
 
-                // Size badge above top-left of active rect
+                // Size pill badge above top-left of active rect
                 self.draw_size_badge(r);
             }
+        }
+
+        // 2.5 Subtle top-center onboarding hint pill before dragging
+        if self.selection.is_none() && self.drag_mode == DragMode::None {
+            self.draw_top_hint_pill();
         }
 
         // 3. Draw floating toolbar
@@ -611,6 +647,57 @@ impl OverlayState {
         }
     }
 
+    fn draw_top_hint_pill(&mut self) {
+        let mon_info = self.monitor_info_for_point(self.cursor_pos.0, self.cursor_pos.1);
+        let mon = mon_info.rect;
+        let dpi = mon_info.dpi;
+        let s = |v: i32| scale_dpi(v, dpi);
+        let sf = dpi as f32 / 96.0;
+
+        let text = "单击选中窗口 · 拖拽自由框选 · 按 C 取色 · 右键 / Esc 退出";
+        let pill_w = s(370).min(mon.width() - s(24));
+        let pill_h = s(30);
+        let shadow = s(10);
+        let px = mon.left + (mon.width() - pill_w) / 2;
+        let py = mon.top + s(18);
+
+        if let Some(mut pm) =
+            Pixmap::new((pill_w + shadow * 2) as u32, (pill_h + shadow * 2) as u32)
+        {
+            let ox = shadow as f32;
+            let oy = shadow as f32;
+            draw_soft_shadow(&mut pm, ox, oy, pill_w as f32, pill_h as f32, 15.0 * sf, sf);
+            fill_rounded_rect(
+                &mut pm,
+                ox,
+                oy,
+                pill_w as f32,
+                pill_h as f32,
+                15.0 * sf,
+                Color::from_rgba8(15, 23, 42, 226),
+            );
+            stroke_rounded_rect(
+                &mut pm,
+                ox + 0.5 * sf,
+                oy + 0.5 * sf,
+                pill_w as f32 - sf,
+                pill_h as f32 - sf,
+                14.5 * sf,
+                1.0 * sf,
+                Color::from_rgba8(255, 255, 255, 36),
+            );
+            self.composite_pixmap(px - shadow, py - shadow, &pm);
+        }
+        self.draw_text_on_surface(
+            text,
+            RectI::new(px, py, px + pill_w, py + pill_h),
+            (226, 232, 240),
+            dpi,
+            true,
+            true,
+        );
+    }
+
     fn draw_size_badge(&mut self, sel: RectI) {
         let mon_info = self.monitor_info_for_point(sel.left, sel.top);
         let mon = mon_info.rect;
@@ -619,10 +706,11 @@ impl OverlayState {
         let sf = dpi as f32 / 96.0;
 
         let text = format!("{} × {}", sel.width(), sel.height());
-        let badge_w = s(98).max(s((text.chars().count() as i32) * 8 + 20));
-        let badge_h = s(26);
-        let pad_edge = s(4);
-        let gap = s(6);
+        let badge_w = s(106).max(s((text.chars().count() as i32) * 8 + 28));
+        let badge_h = s(28);
+        let shadow = s(8);
+        let pad_edge = s(6);
+        let gap = s(8);
         let bx = sel
             .left
             .clamp(mon.left + pad_edge, (mon.right - badge_w - pad_edge).max(mon.left + pad_edge));
@@ -632,21 +720,47 @@ impl OverlayState {
             sel.top + gap
         };
 
-        if let Some(mut pm) = Pixmap::new(badge_w as u32, badge_h as u32) {
+        if let Some(mut pm) =
+            Pixmap::new((badge_w + shadow * 2) as u32, (badge_h + shadow * 2) as u32)
+        {
+            let ox = shadow as f32;
+            let oy = shadow as f32;
+            draw_soft_shadow(&mut pm, ox, oy, badge_w as f32, badge_h as f32, 8.0 * sf, sf);
             fill_rounded_rect(
                 &mut pm,
-                0.0,
-                0.0,
+                ox,
+                oy,
                 badge_w as f32,
                 badge_h as f32,
-                6.0 * sf,
-                Color::from_rgba8(20, 24, 33, 228),
+                8.0 * sf,
+                Color::from_rgba8(15, 23, 42, 234),
             );
-            self.composite_pixmap(bx, by, &pm);
+            stroke_rounded_rect(
+                &mut pm,
+                ox + 0.5 * sf,
+                oy + 0.5 * sf,
+                badge_w as f32 - sf,
+                badge_h as f32 - sf,
+                7.5 * sf,
+                1.0 * sf,
+                Color::from_rgba8(255, 255, 255, 36),
+            );
+            // Tiny glowing sky-cyan status dot on left of dimensions
+            if let Some(dot) = PathBuilder::from_circle(
+                ox + 11.0 * sf,
+                oy + (badge_h as f32) * 0.5,
+                3.0 * sf,
+            ) {
+                let mut paint = Paint::default();
+                paint.set_color(Color::from_rgba8(56, 189, 248, 255));
+                paint.anti_alias = true;
+                pm.fill_path(&dot, &paint, FillRule::Winding, Transform::identity(), None);
+            }
+            self.composite_pixmap(bx - shadow, by - shadow, &pm);
         }
         self.draw_text_on_surface(
             &text,
-            RectI::new(bx, by, bx + badge_w, by + badge_h),
+            RectI::new(bx + s(16), by, bx + badge_w - s(6), by + badge_h),
             (248, 250, 252),
             dpi,
             true,
@@ -664,66 +778,118 @@ impl OverlayState {
         let dpi = self.toolbar_dpi;
         let sf = dpi as f32 / 96.0;
         let s = |v: i32| scale_dpi(v, dpi);
-        let Some(mut pm) = Pixmap::new(tw as u32, th as u32) else {
+        let shadow = s(12);
+        let Some(mut pm) = Pixmap::new((tw + shadow * 2) as u32, (th + shadow * 2) as u32) else {
             return;
         };
 
-        // Panel background with subtle border
+        let ox = shadow as f32;
+        let oy = shadow as f32;
+
+        // Soft multi-layer elevation shadow
+        draw_soft_shadow(&mut pm, ox, oy, tw as f32, th as f32, 12.0 * sf, sf);
+
+        // Dark frosted glass dock surface
         fill_rounded_rect(
             &mut pm,
-            0.0,
-            0.0,
+            ox,
+            oy,
             tw as f32,
             th as f32,
-            9.0 * sf,
-            Color::from_rgba8(24, 28, 38, 242),
+            12.0 * sf,
+            Color::from_rgba8(15, 23, 42, 240),
         );
         stroke_rounded_rect(
             &mut pm,
-            0.5 * sf,
-            0.5 * sf,
+            ox + 0.5 * sf,
+            oy + 0.5 * sf,
             tw as f32 - sf,
             th as f32 - sf,
-            8.5 * sf,
+            11.5 * sf,
             1.0 * sf,
-            Color::from_rgba8(255, 255, 255, 36),
+            Color::from_rgba8(255, 255, 255, 38),
         );
 
+        // Subtle divider before Cancel button
+        if let Some(cancel_btn) = self.buttons.get(3) {
+            let div_x = ox + (cancel_btn.rect.left - tb.left) as f32 - 5.5 * sf;
+            fill_rounded_rect(
+                &mut pm,
+                div_x,
+                oy + 10.0 * sf,
+                (1.0 * sf).max(1.0),
+                th as f32 - 20.0 * sf,
+                0.5 * sf,
+                Color::from_rgba8(255, 255, 255, 32),
+            );
+        }
+
         for btn in &self.buttons {
-            let lx = (btn.rect.left - tb.left) as f32;
-            let ly = (btn.rect.top - tb.top) as f32;
+            let lx = ox + (btn.rect.left - tb.left) as f32;
+            let ly = oy + (btn.rect.top - tb.top) as f32;
             let bw = btn.rect.width() as f32;
             let bh = btn.rect.height() as f32;
             let hovered = self.hovered_button == Some(btn.action);
 
-            let bg = match (btn.action, hovered) {
-                (ToolbarAction::Copy, true) => Some(Color::from_rgba8(37, 99, 235, 255)),
-                (ToolbarAction::Copy, false) => Some(Color::from_rgba8(37, 99, 235, 195)),
-                (ToolbarAction::Cancel, true) => Some(Color::from_rgba8(220, 38, 38, 210)),
-                (_, true) => Some(Color::from_rgba8(255, 255, 255, 42)),
-                _ => None,
-            };
-            if let Some(c) = bg {
-                fill_rounded_rect(&mut pm, lx, ly, bw, bh, 6.0 * sf, c);
+            if btn.action == ToolbarAction::Copy {
+                // Vibrant sky->blue gradient primary action pill
+                let (c0, c1) = if hovered {
+                    (
+                        Color::from_rgba8(56, 189, 248, 255),
+                        Color::from_rgba8(37, 99, 235, 255),
+                    )
+                } else {
+                    (
+                        Color::from_rgba8(14, 165, 233, 240),
+                        Color::from_rgba8(37, 99, 235, 240),
+                    )
+                };
+                if let Some(path) = rounded_rect_path(lx, ly, bw, bh, 8.0 * sf) {
+                    if let Some(grad) = LinearGradient::new(
+                        Point::from_xy(lx, ly),
+                        Point::from_xy(lx + bw, ly + bh),
+                        vec![GradientStop::new(0.0, c0), GradientStop::new(1.0, c1)],
+                        SpreadMode::Pad,
+                        Transform::identity(),
+                    ) {
+                        let mut paint = Paint::default();
+                        paint.shader = grad;
+                        paint.anti_alias = true;
+                        pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+                    }
+                }
+            } else {
+                let bg = match (btn.action, hovered) {
+                    (ToolbarAction::Cancel, true) => Some(Color::from_rgba8(239, 68, 68, 195)),
+                    (_, true) => Some(Color::from_rgba8(255, 255, 255, 30)),
+                    _ => None,
+                };
+                if let Some(c) = bg {
+                    fill_rounded_rect(&mut pm, lx, ly, bw, bh, 8.0 * sf, c);
+                }
             }
 
-            // Draw crisp DPI-scaled vector icon on left of button
-            let ix = lx + 10.0 * sf;
+            let ix = lx + 11.0 * sf;
             let iy = ly + (bh - 14.0 * sf) * 0.5;
             draw_toolbar_icon(&mut pm, btn.action, ix, iy, sf);
         }
 
-        self.composite_pixmap(tb.left, tb.top, &pm);
+        self.composite_pixmap(tb.left - shadow, tb.top - shadow, &pm);
 
         // Draw crisp labels via GDI ClearType at the monitor's exact DPI
         for btn in &self.buttons {
             let text_rect = RectI::new(
-                btn.rect.left + s(26),
+                btn.rect.left + s(27),
                 btn.rect.top,
                 btn.rect.right - s(6),
                 btn.rect.bottom,
             );
-            self.draw_text_on_surface(btn.label, text_rect, (248, 250, 252), dpi, false, true);
+            let txt_color = if btn.action == ToolbarAction::Cancel && self.hovered_button != Some(ToolbarAction::Cancel) {
+                (203, 213, 225)
+            } else {
+                (248, 250, 252)
+            };
+            self.draw_text_on_surface(btn.label, text_rect, txt_color, dpi, false, true);
         }
     }
 
@@ -733,20 +899,22 @@ impl OverlayState {
         let mon = mon_info.rect;
         let dpi = mon_info.dpi;
         let s = |v: i32| scale_dpi(v, dpi);
+        let sf = dpi as f32 / 96.0;
 
         let sample_w = 17;
         let sample_h = 11;
         let zoom = s(9).max(8);
         let view_w = sample_w * zoom;
         let view_h = sample_h * zoom;
-        let info_h = s(48);
-        let pad = s(2).max(2);
+        let pad = s(8);
+        let info_h = s(52);
         let total_w = view_w.max(s(176)) + pad * 2;
         let total_h = view_h + info_h + pad * 2;
         let view_left_off = (total_w - view_w) / 2;
+        let shadow = s(12);
 
         let offset = s(22);
-        let edge_pad = s(8);
+        let edge_pad = s(10);
         let mut mx = cx + offset;
         let mut my = cy + offset;
         if mx + total_w > mon.right - edge_pad {
@@ -755,16 +923,60 @@ impl OverlayState {
         if my + total_h > mon.bottom - edge_pad {
             my = cy - offset - total_h;
         }
-        mx = mx.clamp(mon.left + s(4), (mon.right - total_w - s(4)).max(mon.left + s(4)));
-        my = my.clamp(mon.top + s(4), (mon.bottom - total_h - s(4)).max(mon.top + s(4)));
+        mx = mx.clamp(mon.left + s(6), (mon.right - total_w - s(6)).max(mon.left + s(6)));
+        my = my.clamp(mon.top + s(6), (mon.bottom - total_h - s(6)).max(mon.top + s(6)));
 
-        // Frame background
-        self.fill_rect_solid(
-            RectI::new(mx, my, mx + total_w, my + total_h),
-            [38, 28, 24, 255],
-        );
+        // Rounded floating card with soft shadow
+        if let Some(mut pm) =
+            Pixmap::new((total_w + shadow * 2) as u32, (total_h + shadow * 2) as u32)
+        {
+            let ox = shadow as f32;
+            let oy = shadow as f32;
+            draw_soft_shadow(&mut pm, ox, oy, total_w as f32, total_h as f32, 12.0 * sf, sf);
+            fill_rounded_rect(
+                &mut pm,
+                ox,
+                oy,
+                total_w as f32,
+                total_h as f32,
+                12.0 * sf,
+                Color::from_rgba8(15, 23, 42, 240),
+            );
+            stroke_rounded_rect(
+                &mut pm,
+                ox + 0.5 * sf,
+                oy + 0.5 * sf,
+                total_w as f32 - sf,
+                total_h as f32 - sf,
+                11.5 * sf,
+                1.0 * sf,
+                Color::from_rgba8(255, 255, 255, 42),
+            );
 
-        // Zoomed pixels
+            // Circular color swatch in footer
+            let (r, g, b) = self.capture.image.pixel_rgb(cx, cy).unwrap_or((0, 0, 0));
+            let sw_cx = ox + (pad + s(10)) as f32;
+            let sw_cy = oy + (pad + view_h + s(17)) as f32;
+            let sw_r = 7.0 * sf;
+            if let Some(circ) = PathBuilder::from_circle(sw_cx, sw_cy, sw_r) {
+                let mut paint = Paint::default();
+                paint.set_color(Color::from_rgba8(r, g, b, 255));
+                paint.anti_alias = true;
+                pm.fill_path(&circ, &paint, FillRule::Winding, Transform::identity(), None);
+                let mut ring = Paint::default();
+                ring.set_color(Color::from_rgba8(255, 255, 255, 200));
+                ring.anti_alias = true;
+                let st = Stroke {
+                    width: 1.2 * sf,
+                    ..Stroke::default()
+                };
+                pm.stroke_path(&circ, &ring, &st, Transform::identity(), None);
+            }
+
+            self.composite_pixmap(mx - shadow, my - shadow, &pm);
+        }
+
+        // Zoomed pixel viewport inset inside card
         let half_x = sample_w / 2;
         let half_y = sample_h / 2;
         let img_w = self.capture.image.width as i32;
@@ -780,7 +992,7 @@ impl OverlayState {
                     let d = &self.capture.image.data;
                     [d[idx], d[idx + 1], d[idx + 2], 255]
                 } else {
-                    [20, 20, 20, 255]
+                    [20, 24, 34, 255]
                 };
                 let dx = vx0 + sx_off * zoom;
                 let dy = vy0 + sy_off * zoom;
@@ -788,20 +1000,18 @@ impl OverlayState {
             }
         }
 
-        // Crosshair highlighting center pixel
+        // Subtle pixel grid + luminous cyan crosshair + center cell ring
+        let border_w = s(1).max(1);
         let center_x = vx0 + half_x * zoom;
         let center_y = vy0 + half_y * zoom;
-        let cross_w = s(1).max(1);
-        let accent = [246, 130, 59, 255];
         self.fill_rect_solid(
-            RectI::new(vx0, center_y + zoom / 2, vx0 + view_w, center_y + zoom / 2 + cross_w),
-            accent,
+            RectI::new(vx0, center_y + zoom / 2, vx0 + view_w, center_y + zoom / 2 + border_w),
+            [248, 189, 56, 255],
         );
         self.fill_rect_solid(
-            RectI::new(center_x + zoom / 2, vy0, center_x + zoom / 2 + cross_w, vy0 + view_h),
-            accent,
+            RectI::new(center_x + zoom / 2, vy0, center_x + zoom / 2 + border_w, vy0 + view_h),
+            [248, 189, 56, 255],
         );
-        let border_w = s(1).max(1);
         self.draw_rect_outline(
             RectI::new(
                 center_x - border_w,
@@ -813,44 +1023,34 @@ impl OverlayState {
             [255, 255, 255, 255],
         );
         self.draw_rect_outline(
-            RectI::new(mx, my, mx + total_w, my + total_h),
+            RectI::new(vx0, vy0, vx0 + view_w, vy0 + view_h),
             border_w,
-            accent,
+            [75, 58, 45, 255],
         );
 
         let (r, g, b) = self.capture.image.pixel_rgb(cx, cy).unwrap_or((0, 0, 0));
         let info_top = vy0 + view_h;
-        let swatch_sz = s(14);
-        let swatch = RectI::new(
-            mx + s(8),
-            info_top + s(6),
-            mx + s(8) + swatch_sz,
-            info_top + s(6) + swatch_sz,
-        );
-        self.fill_rect_solid(swatch, [b, g, r, 255]);
-        self.draw_rect_outline(swatch, border_w, [220, 220, 220, 255]);
-
         let hex_line = format!("#{:02X}{:02X}{:02X}  ({},{})", r, g, b, cx, cy);
         self.draw_text_on_surface(
             &hex_line,
             RectI::new(
-                mx + s(14) + swatch_sz,
-                info_top + s(3),
-                mx + total_w - s(6),
-                info_top + s(24),
+                mx + pad + s(24),
+                info_top + s(6),
+                mx + total_w - pad,
+                info_top + s(28),
             ),
-            (241, 245, 249),
+            (248, 250, 252),
             dpi,
             true,
             false,
         );
         self.draw_text_on_surface(
-            "按 C 复制色值  |  右键取消",
+            "按 C 复制色值 · 右键重选",
             RectI::new(
-                mx + s(8),
-                info_top + s(24),
-                mx + total_w - s(6),
-                my + total_h - s(4),
+                mx + pad + s(2),
+                info_top + s(28),
+                mx + total_w - pad,
+                my + total_h - s(6),
             ),
             (148, 163, 184),
             dpi,
@@ -917,6 +1117,58 @@ impl OverlayState {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
     }
+}
+
+fn draw_soft_shadow(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, r: f32, sf: f32) {
+    let layers = [
+        (6.0, 4.0, 14u8),
+        (4.0, 2.8, 22u8),
+        (2.2, 1.5, 34u8),
+        (1.0, 0.8, 46u8),
+    ];
+    for (spread, dy, alpha) in layers {
+        let sp = spread * sf;
+        fill_rounded_rect(
+            pm,
+            x - sp,
+            y - sp + dy * sf,
+            w + sp * 2.0,
+            h + sp * 2.0,
+            r + sp * 0.6,
+            Color::from_rgba8(0, 0, 0, alpha),
+        );
+    }
+}
+
+fn build_circle_handle_pixmap(sf: f32) -> Option<Pixmap> {
+    let dim = (18.0 * sf).ceil().max(16.0) as u32;
+    let mut pm = Pixmap::new(dim, dim)?;
+    let c = dim as f32 * 0.5;
+
+    // Subtle shadow circle
+    if let Some(sh) = PathBuilder::from_circle(c, c + 1.2 * sf, 5.8 * sf) {
+        let mut p = Paint::default();
+        p.set_color(Color::from_rgba8(0, 0, 0, 72));
+        p.anti_alias = true;
+        pm.fill_path(&sh, &p, FillRule::Winding, Transform::identity(), None);
+    }
+    // Crisp white inner pill
+    if let Some(dot) = PathBuilder::from_circle(c, c, 4.8 * sf) {
+        let mut fill = Paint::default();
+        fill.set_color(Color::from_rgba8(255, 255, 255, 255));
+        fill.anti_alias = true;
+        pm.fill_path(&dot, &fill, FillRule::Winding, Transform::identity(), None);
+
+        let mut ring = Paint::default();
+        ring.set_color(Color::from_rgba8(14, 165, 233, 255));
+        ring.anti_alias = true;
+        let st = Stroke {
+            width: 1.8 * sf,
+            ..Stroke::default()
+        };
+        pm.stroke_path(&dot, &ring, &st, Transform::identity(), None);
+    }
+    Some(pm)
 }
 
 fn fill_rounded_rect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, r: f32, color: Color) {
@@ -1405,5 +1657,124 @@ fn finish_with_outcome(outcome: OverlayOutcome) {
     trim_working_set();
     if let Some(cb) = cb {
         cb(outcome);
+    }
+}
+
+#[cfg(test)]
+mod visual_tests {
+    use super::*;
+    use crate::config::SaveFormat;
+    use std::path::PathBuf;
+
+    #[test]
+    #[ignore]
+    fn render_overlay_visual_snapshot() {
+        unsafe {
+            let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+                windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            );
+        }
+        let out_dir = std::env::var("RHPICTURE_SNAPSHOT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+
+        // Synthesize a realistic 225%-DPI desktop frame (1920x1080 region with a light editor card + subtle grid)
+        let w = 1920u32;
+        let h = 1080u32;
+        let mut data = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let idx = ((y * w + x) * 4) as usize;
+                // Soft gradient desktop wallpaper
+                let r = (24 + (x * 26 / w)) as u8;
+                let g = (38 + (y * 34 / h)) as u8;
+                let b = (66 + ((x + y) * 32 / (w + h))) as u8;
+                // Mock bright application window inside selection area
+                let in_win = x >= 260 && x < 1640 && y >= 150 && y < 930;
+                let in_title = in_win && y < 220;
+                let in_card = x >= 340 && x < 1180 && y >= 270 && y < 740;
+                let (cr, cg, cb) = if in_title {
+                    (241u8, 245u8, 249u8)
+                } else if in_card {
+                    if ((x / 40) + (y / 40)) % 2 == 0 {
+                        (255u8, 255u8, 255u8)
+                    } else {
+                        (246u8, 250u8, 255u8)
+                    }
+                } else if in_win {
+                    (248u8, 250u8, 252u8)
+                } else {
+                    (r, g, b)
+                };
+                data[idx] = cb;
+                data[idx + 1] = cg;
+                data[idx + 2] = cr;
+                data[idx + 3] = 255;
+            }
+        }
+        let img = BgraImage::from_bgra(w, h, data).unwrap();
+        let dpi = 216u32; // 225% real user monitor DPI
+        let capture = ScreenCapture {
+            image: img,
+            origin_x: 0,
+            origin_y: 0,
+            monitors: vec![MonitorInfo {
+                rect: RectI::new(0, 0, w as i32, h as i32),
+                dpi,
+            }],
+            window_rects: Vec::new(),
+        };
+        let surface = DibSurface::new(w as i32, h as i32).unwrap();
+        let mut fonts = HashMap::new();
+        for d in [dpi, 96] {
+            fonts.insert(
+                d,
+                (
+                    OwnedFont(create_ui_font(d, 10, false)),
+                    OwnedFont(create_ui_font(d, 9, false)),
+                ),
+            );
+        }
+        let mut state = OverlayState {
+            hwnd: HWND::default(),
+            capture,
+            surface,
+            fonts,
+            show_magnifier: true,
+            smart_window_detect: true,
+            selection: Some(RectI::new(380, 220, 1280, 740)),
+            hover_rect: None,
+            drag_mode: DragMode::None,
+            drag_start: (0, 0),
+            drag_orig_sel: RectI::default(),
+            cursor_pos: (1260, 420),
+            toolbar_rect: RectI::default(),
+            toolbar_dpi: dpi,
+            buttons: Vec::new(),
+            hovered_button: Some(ToolbarAction::Copy),
+            on_finish: None,
+            finished: false,
+        };
+        state.render();
+        let mut pix1 = state.surface.pixels_mut().to_vec();
+        for px in pix1.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        let out = BgraImage::from_bgra(w, h, pix1).unwrap();
+        out.save_to_file(&out_dir.join("overlay-selected.png"), SaveFormat::Png)
+            .unwrap();
+
+        // Also render hover / pre-selection state with L-corner viewfinder + top hint pill + magnifier!
+        state.selection = None;
+        state.hover_rect = Some(RectI::new(340, 270, 1180, 740));
+        state.cursor_pos = (880, 460);
+        state.render();
+        let mut pix2 = state.surface.pixels_mut().to_vec();
+        for px in pix2.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        let out2 = BgraImage::from_bgra(w, h, pix2).unwrap();
+        out2.save_to_file(&out_dir.join("overlay-hover.png"), SaveFormat::Png)
+            .unwrap();
     }
 }

@@ -1,41 +1,50 @@
+//! Modern Windows 11 dark-slate Fluent Settings window rendered purely on CPU (0 MB VRAM)
+//! via tiny-skia vector cards/toggles/segmented pills + GDI ClearType typography, with borderless
+//! native Win32 EDIT controls embedded cleanly inside rounded input frames.
+
+use crate::capture::RectI;
 use crate::config::{AppConfig, PinDoubleClickAction, ProxyConfig, SaveFormat, UpdateProvider};
-use crate::hotkey::{
-    HotkeySpec, MOD_FLAG_ALT, MOD_FLAG_CTRL, MOD_FLAG_SHIFT, MOD_FLAG_WIN,
-};
+use crate::hotkey::{HotkeySpec, MOD_FLAG_ALT, MOD_FLAG_CTRL, MOD_FLAG_SHIFT, MOD_FLAG_WIN};
 use crate::pin;
-use crate::updater::{APP_VERSION, UpdateService};
+use crate::update_splash::draw_rhpicture_emblem;
+use crate::updater::{APP_VERSION, UpdatePhase, UpdateService};
 use crate::util::{
-    OwnedBrush, OwnedFont, browse_folder_dialog, create_ui_font, current_hinstance, from_wide,
-    get_auto_start, load_app_icon, process_memory_mb, rgb_colorref, scale_dpi, set_auto_start,
-    to_wide, window_dpi,
+    DibSurface, OwnedBrush, OwnedFont, browse_folder_dialog, create_ui_font, current_hinstance,
+    from_wide, get_auto_start, load_app_icon, process_memory_mb, rgb_colorref, scale_dpi,
+    set_auto_start, to_wide, window_dpi,
 };
 use std::cell::{Cell, RefCell};
+use std::os::windows::process::CommandExt;
 use std::sync::{Arc, Once};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{HDC, InvalidateRect, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT};
-use windows::Win32::UI::Controls::{
-    EM_SETREADONLY, ICC_BAR_CLASSES, ICC_PROGRESS_CLASS, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES,
-    INITCOMMONCONTROLSEX, InitCommonControlsEx, NMHDR, PBM_SETPOS, PBM_SETRANGE32, PROGRESS_CLASSW,
-    TCIF_TEXT, TCITEMW, TCM_GETCURSEL, TCM_INSERTITEMW, TCM_SETCURSEL, TCN_SELCHANGE,
-    WC_TABCONTROLW,
+use tiny_skia::{
+    Color, FillRule, GradientStop, LineCap, LineJoin, LinearGradient, Paint, PathBuilder, Pixmap,
+    Point, SpreadMode, Stroke, Transform,
 };
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, BitBlt, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOCLIP, DT_RIGHT,
+    DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DrawTextW, EndPaint, HDC, IntersectClipRect,
+    InvalidateRect, PAINTSTRUCT, RestoreDC, SRCCOPY, SaveDC, SelectObject, SetBkColor, SetBkMode,
+    SetTextColor, TRANSPARENT,
+};
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetAsyncKeyState, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_LWIN,
-    VK_MENU, VK_RWIN, VK_SHIFT,
+    GetAsyncKeyState, GetFocus, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_BACK,
+    VK_CONTROL, VK_DELETE, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CB_ADDSTRING,
-    CB_GETCURSEL, CB_SETCURSEL, CBN_SELCHANGE, CBS_DROPDOWNLIST, CallWindowProcW, CreateWindowExW,
-    DefWindowProcW, DestroyWindow, EN_CHANGE, EN_KILLFOCUS, ES_AUTOHSCROLL, ES_MULTILINE,
-    ES_READONLY, ES_WANTRETURN, GWLP_WNDPROC, GetClientRect, GetSystemMetrics,
-    GetWindowTextLengthW, GetWindowTextW, HMENU, HWND_BOTTOM, IDC_ARROW, KillTimer, LoadCursorW,
-    RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, SetWindowTextW, ShowWindow, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_GETFONT, WM_KEYDOWN, WM_KILLFOCUS, WM_NCDESTROY, WM_NOTIFY,
-    WM_SETFOCUS, WM_SETFONT, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WNDPROC, WS_BORDER, WS_CAPTION,
-    WS_CHILD, WS_CLIPSIBLINGS, WS_EX_CLIENTEDGE, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
-    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, EN_CHANGE, EN_KILLFOCUS, EN_SETFOCUS,
+    ES_AUTOHSCROLL, GetClientRect, GetSystemMetrics, GetWindowTextLengthW, GetWindowTextW, HMENU,
+    IDC_ARROW, IDC_HAND, KillTimer, LoadCursorW, RegisterClassExW, SM_CXSCREEN, SM_CYSCREEN,
+    SW_HIDE, SW_RESTORE, SW_SHOW, SendMessageW, SetCursor, SetForegroundWindow, SetTimer,
+    SetWindowPos, SetWindowTextW, ShowWindow, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_SETCURSOR, WM_SETFONT, WM_SYSKEYDOWN, WM_TIMER,
+    WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
 };
 use windows::core::PCWSTR;
 
@@ -43,50 +52,11 @@ const SETTINGS_CLASS: &str = "RHPictureSettingsClass";
 const TIMER_STATS: usize = 10;
 const TIMER_AUTOSAVE: usize = 11;
 
-// Control IDs
-const ID_TAB: usize = 100;
-const ID_BTN_CLOSE: usize = 102;
-const ID_LBL_FOOTER: usize = 103;
-
-// Tab 0: General & Hotkeys
-const ID_EDIT_HK_SHOT: usize = 201;
-const ID_BTN_CLR_SHOT: usize = 202;
-const ID_EDIT_HK_PIN: usize = 203;
-const ID_BTN_CLR_PIN: usize = 204;
-const ID_EDIT_HK_TOGGLE: usize = 205;
-const ID_BTN_CLR_TOGGLE: usize = 206;
-const ID_CHK_AUTOSTART: usize = 207;
-const ID_CHK_SMART_WIN: usize = 208;
-const ID_CHK_MAGNIFIER: usize = 209;
-
-// Tab 1: Pin & Save
 const ID_EDIT_SAVE_DIR: usize = 301;
-const ID_BTN_BROWSE_DIR: usize = 302;
-const ID_CMB_FORMAT: usize = 303;
-const ID_CHK_QUICK_SAVE: usize = 304;
-const ID_CMB_PIN_DBLCLK: usize = 305;
-const ID_CHK_PIN_BORDER: usize = 306;
-const ID_LBL_MEM_STATS: usize = 307;
-const ID_BTN_HIDE_PINS: usize = 308;
-const ID_BTN_SHOW_PINS: usize = 309;
-const ID_BTN_CLOSE_PINS: usize = 310;
-
-// Tab 2: Updates
-const ID_LBL_VERSION: usize = 401;
-const ID_CMB_UPDATE_SRC: usize = 402;
 const ID_EDIT_CNB_URL: usize = 403;
 const ID_EDIT_GITHUB_URL: usize = 404;
-const ID_CHK_PROXY: usize = 405;
-const ID_CMB_PROXY_PROTO: usize = 406;
 const ID_EDIT_PROXY_HOST: usize = 407;
 const ID_EDIT_PROXY_PORT: usize = 408;
-const ID_CHK_AUTO_UPDATE: usize = 409;
-const ID_BTN_UPDATE_PRIMARY: usize = 410;
-const ID_BTN_UPDATE_CHECK: usize = 411;
-const ID_BTN_UPDATE_CANCEL: usize = 412;
-const ID_PROGRESS_UPDATE: usize = 413;
-const ID_LBL_UPDATE_STATUS: usize = 414;
-const ID_EDIT_UPDATE_NOTES: usize = 415;
 
 pub struct SettingsCallbacks {
     pub on_config_saved: Box<dyn Fn(AppConfig) -> Vec<String>>,
@@ -94,55 +64,86 @@ pub struct SettingsCallbacks {
     pub on_exit_for_update: Arc<dyn Fn() + Send + Sync>,
 }
 
-struct SettingsWindow {
-    hwnd: HWND,
-    tab_ctrl: HWND,
-    active_tab: Cell<usize>,
-    ready: Cell<bool>,
-    pending_autosave: Cell<bool>,
-    tab_controls: [Vec<HWND>; 3],
-    controls: ControlHandles,
-    font_ui: OwnedFont,
-    font_bold: OwnedFont,
-    bg_brush: OwnedBrush,
-    updater: UpdateService,
-    callbacks: SettingsCallbacks,
-    orig_hotkey_procs: [WNDPROC; 3],
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HitKind {
+    NavTab(usize),
+    HotkeyRecord(usize),
+    HotkeyClear(usize),
+    ToggleAutoStart,
+    ToggleSmartWin,
+    ToggleMagnifier,
+    BrowseSaveDir,
+    FormatSeg(usize),
+    ToggleQuickSave,
+    PinDblClkSeg(usize),
+    TogglePinBorder,
+    HideAllPins,
+    ShowAllPins,
+    CloseAllPins,
+    UpdatePrimary,
+    UpdateRecheck,
+    UpdateCancel,
+    UpdatePreviewSplash,
+    UpdateSourceSeg(usize),
+    ToggleAutoCheck,
+    ToggleProxy,
+    ProxyProtoSeg(usize),
+}
+
+#[derive(Clone, Copy)]
+struct HitZone {
+    rect: RectI,
+    kind: HitKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToastTone {
+    Muted,
+    Success,
+    Warning,
+    Error,
 }
 
 #[derive(Default)]
-struct ControlHandles {
-    footer_lbl: HWND,
-    // Tab 0
-    hk_shot: HWND,
-    hk_pin: HWND,
-    hk_toggle: HWND,
-    chk_autostart: HWND,
-    chk_smart_win: HWND,
-    chk_magnifier: HWND,
-    // Tab 1
+struct EditHandles {
     save_dir: HWND,
-    cmb_format: HWND,
-    chk_quick_save: HWND,
-    cmb_pin_dblclk: HWND,
-    chk_pin_border: HWND,
-    mem_stats: HWND,
-    // Tab 2
-    lbl_version: HWND,
-    cmb_update_src: HWND,
-    edit_cnb_url: HWND,
-    edit_github_url: HWND,
-    chk_proxy: HWND,
-    cmb_proxy_proto: HWND,
-    edit_proxy_host: HWND,
-    edit_proxy_port: HWND,
-    chk_auto_update: HWND,
-    btn_update_primary: HWND,
-    btn_update_check: HWND,
-    btn_update_cancel: HWND,
-    progress_update: HWND,
-    lbl_update_status: HWND,
-    edit_update_notes: HWND,
+    cnb_url: HWND,
+    github_url: HWND,
+    proxy_host: HWND,
+    proxy_port: HWND,
+}
+
+struct SettingsWindow {
+    hwnd: HWND,
+    dpi: u32,
+    client_w: i32,
+    client_h: i32,
+    active_tab: Cell<usize>,
+    ready: Cell<bool>,
+    pending_autosave: Cell<bool>,
+    recording_slot: Cell<Option<usize>>,
+    hovered: Cell<Option<HitKind>>,
+    tracking_leave: Cell<bool>,
+    focused_edit: Cell<Option<usize>>,
+    notes_scroll: Cell<i32>,
+    notes_max_scroll: Cell<i32>,
+
+    cfg: RefCell<AppConfig>,
+    toast: RefCell<(String, ToastTone)>,
+    hits: RefCell<Vec<HitZone>>,
+    edits: EditHandles,
+
+    font_brand: OwnedFont,
+    font_h1: OwnedFont,
+    font_sec: OwnedFont,
+    font_body: OwnedFont,
+    font_body_bold: OwnedFont,
+    font_small: OwnedFont,
+    font_input: OwnedFont,
+    edit_bg_brush: OwnedBrush,
+
+    updater: UpdateService,
+    callbacks: SettingsCallbacks,
 }
 
 thread_local! {
@@ -153,12 +154,6 @@ static REGISTER_CLASS: Once = Once::new();
 
 fn ensure_registered() {
     REGISTER_CLASS.call_once(|| unsafe {
-        let icc = INITCOMMONCONTROLSEX {
-            dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_TAB_CLASSES | ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES | ICC_BAR_CLASSES,
-        };
-        let _ = InitCommonControlsEx(&icc);
-
         let class_w = to_wide(SETTINGS_CLASS);
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -167,9 +162,6 @@ fn ensure_registered() {
             hIcon: load_app_icon(32).unwrap_or_default(),
             hIconSm: load_app_icon(16).unwrap_or_default(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(
-                (windows::Win32::Graphics::Gdi::COLOR_WINDOW.0 + 1) as *mut _,
-            ),
             lpszClassName: PCWSTR(class_w.as_ptr()),
             ..Default::default()
         };
@@ -183,15 +175,14 @@ pub fn open_settings(
     initial_tab: Option<usize>,
     callbacks: SettingsCallbacks,
 ) {
-    // If already open, bring to front and optionally switch tab (never hold borrow_mut across Win32 calls!)
     let existing = SETTINGS.with(|cell| {
         let borrow = cell.borrow();
         let win = borrow.as_ref()?;
         if let Some(t) = initial_tab {
             win.switch_tab(t.min(2));
         }
-        win.refresh_memory_stats();
-        win.refresh_update_ui();
+        win.sync_update_notes_edit();
+        win.request_repaint();
         Some(win.hwnd)
     });
     if let Some(hwnd) = existing {
@@ -207,12 +198,10 @@ pub fn open_settings(
 
     let class_w = to_wide(SETTINGS_CLASS);
     let title_w = to_wide("RHPicture 设置");
-    let win_w = 590;
-    let win_h = 540;
+    let logical_w = 760;
+    let logical_h = 590;
     let sx = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let sy = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    let x = ((sx - win_w) / 2).max(40);
-    let y = ((sy - win_h) / 2).max(40);
 
     let Ok(hwnd) = (unsafe {
         CreateWindowExW(
@@ -220,10 +209,10 @@ pub fn open_settings(
             PCWSTR(class_w.as_ptr()),
             PCWSTR(title_w.as_ptr()),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-            x,
-            y,
-            win_w,
-            win_h,
+            (sx - logical_w) / 2,
+            (sy - logical_h) / 2,
+            logical_w,
+            logical_h,
             None,
             None,
             Some(current_hinstance()),
@@ -233,52 +222,104 @@ pub fn open_settings(
         return;
     };
 
-    let dpi = window_dpi(hwnd);
-    let scaled_w = scale_dpi(win_w, dpi);
-    let scaled_h = scale_dpi(win_h, dpi);
-    let sx_pos = ((sx - scaled_w) / 2).max(20);
-    let sy_pos = ((sy - scaled_h) / 2).max(20);
+    // Enable Windows 11 native dark titlebar + rounded corners matching our slate theme
     unsafe {
-        let _ = SetWindowPos(hwnd, None, sx_pos, sy_pos, scaled_w, scaled_h, Default::default());
+        let dark: i32 = 1;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark as *const i32 as *const _,
+            std::mem::size_of::<i32>() as u32,
+        );
+        let cap_color = rgb_colorref(11, 17, 32);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR,
+            &cap_color as *const COLORREF as *const _,
+            std::mem::size_of::<COLORREF>() as u32,
+        );
+        let txt_color = rgb_colorref(226, 232, 240);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TEXT_COLOR,
+            &txt_color as *const COLORREF as *const _,
+            std::mem::size_of::<COLORREF>() as u32,
+        );
+        let corner = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &corner as *const _ as *const _,
+            std::mem::size_of_val(&corner) as u32,
+        );
     }
 
-    let font_ui = OwnedFont(create_ui_font(dpi, 9, false));
-    let font_bold = OwnedFont(create_ui_font(dpi, 9, true));
-    let bg_brush = OwnedBrush::solid(255, 255, 255);
+    let dpi = window_dpi(hwnd);
+    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    let mut adj = RECT {
+        left: 0,
+        top: 0,
+        right: scale_dpi(logical_w, dpi),
+        bottom: scale_dpi(logical_h, dpi),
+    };
+    unsafe {
+        let _ = windows::Win32::UI::HiDpi::AdjustWindowRectExForDpi(
+            &mut adj,
+            style,
+            false,
+            Default::default(),
+            dpi,
+        );
+    }
+    let win_w = adj.right - adj.left;
+    let win_h = adj.bottom - adj.top;
+    let x = ((sx - win_w) / 2).max(20);
+    let y = ((sy - win_h) / 2).max(20);
+    unsafe {
+        let _ = SetWindowPos(hwnd, None, x, y, win_w, win_h, Default::default());
+    }
+
+    let mut client = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut client);
+    }
+
+    let mut cfg = config.clone();
+    cfg.auto_start = get_auto_start() || cfg.auto_start;
 
     let mut win = Box::new(SettingsWindow {
         hwnd,
-        tab_ctrl: HWND::default(),
+        dpi,
+        client_w: (client.right - client.left).max(1),
+        client_h: (client.bottom - client.top).max(1),
         active_tab: Cell::new(initial_tab.unwrap_or(0).min(2)),
         ready: Cell::new(false),
         pending_autosave: Cell::new(false),
-        tab_controls: [Vec::new(), Vec::new(), Vec::new()],
-        controls: ControlHandles::default(),
-        font_ui,
-        font_bold,
-        bg_brush,
+        recording_slot: Cell::new(None),
+        hovered: Cell::new(None),
+        tracking_leave: Cell::new(false),
+        focused_edit: Cell::new(None),
+        notes_scroll: Cell::new(0),
+        notes_max_scroll: Cell::new(0),
+        cfg: RefCell::new(cfg.clone()),
+        toast: RefCell::new(("修改后自动保存".into(), ToastTone::Muted)),
+        hits: RefCell::new(Vec::new()),
+        edits: EditHandles::default(),
+        font_brand: OwnedFont(create_ui_font(dpi, 12, true)),
+        font_h1: OwnedFont(create_ui_font(dpi, 14, true)),
+        font_sec: OwnedFont(create_ui_font(dpi, 8, true)),
+        font_body: OwnedFont(create_ui_font(dpi, 9, false)),
+        font_body_bold: OwnedFont(create_ui_font(dpi, 9, true)),
+        font_small: OwnedFont(create_ui_font(dpi, 8, false)),
+        font_input: OwnedFont(create_ui_font(dpi, 9, false)),
+        edit_bg_brush: OwnedBrush::solid(14, 22, 39),
         updater,
         callbacks,
-        orig_hotkey_procs: [None, None, None],
     });
 
-    win.build_ui(dpi, config);
-    // Keep the tab control at the bottom of sibling Z-order so page controls always sit on top.
-    unsafe {
-        let _ = SetWindowPos(
-            win.tab_ctrl,
-            Some(HWND_BOTTOM),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-    }
-    let init_tab = win.active_tab.get();
-    win.switch_tab(init_tab);
-    win.refresh_memory_stats();
-    win.refresh_update_ui();
+    win.create_embedded_edits(&cfg);
+    win.sync_update_notes_edit();
+    win.update_edit_visibility();
     win.ready.set(true);
 
     SETTINGS.with(|cell| {
@@ -289,6 +330,7 @@ pub fn open_settings(
         let _ = SetTimer(Some(hwnd), TIMER_STATS, 1500, None);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
+        let _ = InvalidateRect(Some(hwnd), None, false);
     }
 }
 
@@ -296,7 +338,8 @@ pub fn notify_update_changed() {
     SETTINGS.with(|cell| {
         if let Ok(borrow) = cell.try_borrow() {
             if let Some(win) = borrow.as_ref() {
-                win.refresh_update_ui();
+                win.sync_update_notes_edit();
+                win.request_repaint();
             }
         }
     });
@@ -309,6 +352,75 @@ pub fn close_settings_if_open() {
             let _ = DestroyWindow(hwnd);
         }
     }
+}
+
+/// Helper used for visual verification snapshots of each tab (including embedded Win32 EDIT children).
+pub fn capture_settings_snapshot(tab: usize, output_path: &std::path::Path) -> bool {
+    SETTINGS.with(|cell| {
+        let borrow = cell.borrow();
+        let Some(win) = borrow.as_ref() else {
+            return false;
+        };
+        win.switch_tab(tab.min(2));
+        let Some(mut surface) = DibSurface::new(win.client_w, win.client_h) else {
+            return false;
+        };
+        win.render_to_surface(&mut surface);
+
+        // Composite visible embedded EDIT controls on top so snapshots reflect exact live appearance.
+        const WM_PRINTCLIENT: u32 = 0x0318;
+        const PRF_CLIENT: usize = 0x04;
+        const PRF_ERASEBKGND: usize = 0x08;
+        let tab_edits: Vec<(HWND, RectI)> = match tab.min(2) {
+            1 => vec![(win.edits.save_dir, win.inset_edit(win.save_dir_box()))],
+            2 => vec![
+                (win.edits.cnb_url, win.inset_edit(win.cnb_url_box())),
+                (win.edits.github_url, win.inset_edit(win.github_url_box())),
+                (win.edits.proxy_host, win.inset_edit(win.proxy_host_box())),
+                (win.edits.proxy_port, win.inset_edit(win.proxy_port_box())),
+            ],
+            _ => Vec::new(),
+        };
+        for (ehwnd, r) in tab_edits {
+            if !ehwnd.is_invalid() && r.width() > 0 && r.height() > 0 {
+                if let Some(child_surf) = DibSurface::new(r.width(), r.height()) {
+                    unsafe {
+                        let _ = SendMessageW(
+                            ehwnd,
+                            WM_PRINTCLIENT,
+                            Some(WPARAM(child_surf.dc.0 as usize)),
+                            Some(LPARAM((PRF_CLIENT | PRF_ERASEBKGND) as isize)),
+                        );
+                        let _ = BitBlt(
+                            surface.dc,
+                            r.left,
+                            r.top,
+                            r.width(),
+                            r.height(),
+                            Some(child_surf.dc),
+                            0,
+                            0,
+                            SRCCOPY,
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut pixels = surface.pixels_mut().to_vec();
+        for px in pixels.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        if let Ok(img) = crate::image_ops::BgraImage::from_bgra(
+            win.client_w as u32,
+            win.client_h as u32,
+            pixels,
+        ) {
+            img.save_to_file(output_path, SaveFormat::Png).is_ok()
+        } else {
+            false
+        }
+    })
 }
 
 fn set_font(hwnd: HWND, font: windows::Win32::Graphics::Gdi::HFONT) {
@@ -336,59 +448,35 @@ fn set_text(hwnd: HWND, text: &str) {
     }
 }
 
-fn is_checked(hwnd: HWND) -> bool {
-    unsafe { SendMessageW(hwnd, BM_GETCHECK, None, None).0 == 1 }
-}
-
-fn set_checked(hwnd: HWND, checked: bool) {
-    unsafe {
-        let _ = SendMessageW(hwnd, BM_SETCHECK, Some(WPARAM(if checked { 1 } else { 0 })), None);
+impl SettingsWindow {
+    fn s(&self, logical: i32) -> i32 {
+        scale_dpi(logical, self.dpi)
     }
-}
 
-fn combo_add(hwnd: HWND, items: &[&str], selected: usize) {
-    for item in items {
-        let w = to_wide(item);
+    fn sf(&self) -> f32 {
+        self.dpi as f32 / 96.0
+    }
+
+    fn request_repaint(&self) {
         unsafe {
-            let _ = SendMessageW(hwnd, CB_ADDSTRING, None, Some(LPARAM(w.as_ptr() as isize)));
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
     }
-    unsafe {
-        let _ = SendMessageW(hwnd, CB_SETCURSEL, Some(WPARAM(selected)), None);
-    }
-}
 
-fn combo_sel(hwnd: HWND) -> usize {
-    let idx = unsafe { SendMessageW(hwnd, CB_GETCURSEL, None, None).0 };
-    if idx < 0 { 0 } else { idx as usize }
-}
-
-impl SettingsWindow {
-    fn create_child(
-        &self,
-        class: &str,
-        text: &str,
-        style: u32,
-        ex_style: u32,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
-        id: usize,
-        bold: bool,
-    ) -> HWND {
-        let class_w = to_wide(class);
+    fn create_borderless_edit(&self, text: &str, id: usize, rect: RectI) -> HWND {
+        let class_w = to_wide("EDIT");
         let text_w = to_wide(text);
+        let style = (WS_CHILD | WS_TABSTOP).0 | ES_AUTOHSCROLL as u32;
         let hwnd = unsafe {
             CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(ex_style),
+                Default::default(),
                 PCWSTR(class_w.as_ptr()),
                 PCWSTR(text_w.as_ptr()),
                 windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(style),
-                x,
-                y,
-                w,
-                h,
+                rect.left,
+                rect.top,
+                rect.width().max(10),
+                rect.height().max(10),
                 Some(self.hwnd),
                 Some(HMENU(id as *mut _)),
                 Some(current_hinstance()),
@@ -396,918 +484,186 @@ impl SettingsWindow {
             )
             .unwrap_or_default()
         };
-        set_font(hwnd, if bold { self.font_bold.0 } else { self.font_ui.0 });
+        set_font(hwnd, self.font_input.0);
         hwnd
     }
 
-    fn build_ui(&mut self, dpi: u32, cfg: &AppConfig) {
-        let s = |v: i32| scale_dpi(v, dpi);
-        let mut client = RECT::default();
-        unsafe {
-            let _ = GetClientRect(self.hwnd, &mut client);
-        }
-        let cw = client.right - client.left;
-        let ch = client.bottom - client.top;
-
-        let pad = s(14);
-        let footer_h = s(44);
-
-        // Tab control
-        let tab_w = cw - pad * 2;
-        let tab_h = ch - pad * 2 - footer_h;
-        let tab_class = from_wide(unsafe { WC_TABCONTROLW.as_wide() });
-        self.tab_ctrl = self.create_child(
-            &tab_class,
-            "",
-            (WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP).0,
-            0,
-            pad,
-            pad,
-            tab_w,
-            tab_h,
-            ID_TAB,
-            false,
-        );
-        for (i, title) in ["快捷键与常规", "贴图与保存", "更新设置"].iter().enumerate() {
-            let mut title_w = to_wide(title);
-            let item = TCITEMW {
-                mask: TCIF_TEXT,
-                pszText: windows::core::PWSTR(title_w.as_mut_ptr()),
-                ..Default::default()
-            };
-            unsafe {
-                let _ = SendMessageW(
-                    self.tab_ctrl,
-                    TCM_INSERTITEMW,
-                    Some(WPARAM(i)),
-                    Some(LPARAM(&item as *const TCITEMW as isize)),
-                );
-            }
-        }
-
-        // Footer bar (all changes auto-save immediately)
-        let fy = ch - footer_h;
-        self.controls.footer_lbl = self.create_child(
-            "STATIC",
-            "修改设置将自动保存并立即生效",
-            (WS_CHILD | WS_VISIBLE).0,
-            0,
-            pad,
-            fy + s(11),
-            cw - pad * 2 - s(100),
-            s(22),
-            ID_LBL_FOOTER,
-            false,
-        );
-        self.create_child(
-            "BUTTON",
-            "关闭",
-            (WS_CHILD | WS_VISIBLE | WS_TABSTOP).0 | BS_PUSHBUTTON as u32,
-            0,
-            cw - pad - s(88),
-            fy + s(6),
-            s(88),
-            s(30),
-            ID_BTN_CLOSE,
-            false,
-        );
-
-        let left = pad + s(18);
-        let top = pad + s(40);
-        let inner_w = tab_w - s(36);
-
-        // ==================== TAB 0: 快捷键与常规 ====================
-        {
-            let mut list = Vec::new();
-            let mut y = top;
-
-            list.push(self.create_child(
-                "STATIC",
-                "全局快捷键（点击输入框后直接按下目标组合键，Backspace 清空）",
-                (WS_CHILD).0,
-                0,
-                left,
-                y,
-                inner_w,
-                s(20),
-                0,
-                true,
-            ));
-            y += s(28);
-
-            let rows = [
-                ("开始截图快捷键：", &cfg.screenshot_hotkey, ID_EDIT_HK_SHOT, ID_BTN_CLR_SHOT, 0usize),
-                ("剪贴板贴图快捷键：", &cfg.pin_clipboard_hotkey, ID_EDIT_HK_PIN, ID_BTN_CLR_PIN, 1usize),
-                ("隐藏/显示全部贴图：", &cfg.toggle_pins_hotkey, ID_EDIT_HK_TOGGLE, ID_BTN_CLR_TOGGLE, 2usize),
-            ];
-            for (label, val, edit_id, clr_id, slot_idx) in rows {
-                list.push(self.create_child(
-                    "STATIC",
-                    label,
-                    (WS_CHILD).0,
-                    0,
-                    left,
-                    y + s(4),
-                    s(145),
-                    s(22),
-                    0,
-                    false,
-                ));
-                let display = if val.trim().is_empty() { "无" } else { val.as_str() };
-                let edit = self.create_child(
-                    "EDIT",
-                    display,
-                    (WS_CHILD | WS_TABSTOP | WS_BORDER).0 | ES_READONLY as u32,
-                    WS_EX_CLIENTEDGE.0,
-                    left + s(150),
-                    y,
-                    s(210),
-                    s(26),
-                    edit_id,
-                    true,
-                );
-                let prev = unsafe {
-                    let prev_ptr = SetWindowLongPtrW(edit, GWLP_WNDPROC, hotkey_edit_proc as *const () as isize);
-                    if prev_ptr != 0 {
-                        Some(std::mem::transmute::<isize, unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT>(prev_ptr))
-                    } else {
-                        None
-                    }
-                };
-                self.orig_hotkey_procs[slot_idx] = prev;
-                match slot_idx {
-                    0 => self.controls.hk_shot = edit,
-                    1 => self.controls.hk_pin = edit,
-                    _ => self.controls.hk_toggle = edit,
-                }
-                list.push(edit);
-
-                let clr = self.create_child(
-                    "BUTTON",
-                    "清空",
-                    (WS_CHILD | WS_TABSTOP).0 | BS_PUSHBUTTON as u32,
-                    0,
-                    left + s(370),
-                    y,
-                    s(60),
-                    s(26),
-                    clr_id,
-                    false,
-                );
-                list.push(clr);
-                y += s(36);
-            }
-
-            y += s(10);
-            list.push(self.create_child(
-                "STATIC",
-                "常规选项",
-                (WS_CHILD).0,
-                0,
-                left,
-                y,
-                inner_w,
-                s(20),
-                0,
-                true,
-            ));
-            y += s(26);
-
-            self.controls.chk_autostart = self.create_child(
-                "BUTTON",
-                "开机自动启动 RHPicture（后台常驻托盘，零显存占用）",
-                (WS_CHILD | WS_TABSTOP).0 | BS_AUTOCHECKBOX as u32,
-                0,
-                left,
-                y,
-                inner_w,
-                s(24),
-                ID_CHK_AUTOSTART,
-                false,
-            );
-            set_checked(self.controls.chk_autostart, get_auto_start() || cfg.auto_start);
-            list.push(self.controls.chk_autostart);
-            y += s(28);
-
-            self.controls.chk_smart_win = self.create_child(
-                "BUTTON",
-                "截图时自动识别窗口边界（鼠标悬停自动框选，单击即可截取）",
-                (WS_CHILD | WS_TABSTOP).0 | BS_AUTOCHECKBOX as u32,
-                0,
-                left,
-                y,
-                inner_w,
-                s(24),
-                ID_CHK_SMART_WIN,
-                false,
-            );
-            set_checked(self.controls.chk_smart_win, cfg.smart_window_detect);
-            list.push(self.controls.chk_smart_win);
-            y += s(28);
-
-            self.controls.chk_magnifier = self.create_child(
-                "BUTTON",
-                "截图时显示像素放大镜与取色器（悬停按 C 复制 #HEX 色值）",
-                (WS_CHILD | WS_TABSTOP).0 | BS_AUTOCHECKBOX as u32,
-                0,
-                left,
-                y,
-                inner_w,
-                s(24),
-                ID_CHK_MAGNIFIER,
-                false,
-            );
-            set_checked(self.controls.chk_magnifier, cfg.show_magnifier);
-            list.push(self.controls.chk_magnifier);
-            y += s(36);
-
-            list.push(self.create_child(
-                "STATIC",
-                "快捷操作说明：\r\n• 截图时：双击选区/Enter/Ctrl+C 复制，F3/T 贴图，Ctrl+S 保存，右键重选，方向键 1px 微调\r\n• 贴图上：左键拖动，滚轮缩放，Ctrl+滚轮调透明度，双击隐藏，H 隐藏，R 旋转，Esc 关闭",
-                (WS_CHILD).0,
-                0,
-                left,
-                y,
-                inner_w,
-                s(64),
-                0,
-                false,
-            ));
-
-            self.tab_controls[0] = list;
-        }
-
-        // ==================== TAB 1: 贴图与保存 ====================
-        {
-            let mut list = Vec::new();
-            let mut y = top;
-
-            list.push(self.create_child(
-                "STATIC",
-                "本地保存设置",
-                (WS_CHILD).0,
-                0,
-                left,
-                y,
-                inner_w,
-                s(20),
-                0,
-                true,
-            ));
-            y += s(26);
-
-            list.push(self.create_child(
-                "STATIC",
-                "默认保存目录：",
-                (WS_CHILD).0,
-                0,
-                left,
-                y + s(4),
-                s(108),
-                s(22),
-                0,
-                false,
-            ));
-            self.controls.save_dir = self.create_child(
-                "EDIT",
-                &cfg.save_dir,
-                (WS_CHILD | WS_TABSTOP | WS_BORDER).0 | ES_AUTOHSCROLL as u32,
-                WS_EX_CLIENTEDGE.0,
-                left + s(112),
-                y,
-                inner_w - s(190),
-                s(26),
-                ID_EDIT_SAVE_DIR,
-                false,
-            );
-            list.push(self.controls.save_dir);
-            list.push(self.create_child(
-                "BUTTON",
-                "浏览…",
-                (WS_CHILD | WS_TABSTOP).0 | BS_PUSHBUTTON as u32,
-                0,
-                left + inner_w - s(70),
-                y,
-                s(70),
-                s(26),
-                ID_BTN_BROWSE_DIR,
-                false,
-            ));
-            y += s(36);
-
-            list.push(self.create_child(
-                "STATIC",
-                "默认图像格式：",
-                (WS_CHILD).0,
-                0,
-                left,
-                y + s(4),
-                s(108),
-                s(22),
-                0,
-                false,
-            ));
-            self.controls.cmb_format = self.create_child(
-                "COMBOBOX",
-                "",
-                (WS_CHILD | WS_TABSTOP | WS_VSCROLL).0 | CBS_DROPDOWNLIST as u32,
-                0,
-                left + s(112),
-                y,
-                s(200),
-                s(120),
-                ID_CMB_FORMAT,
-                false,
-            );
-            combo_add(
-                self.controls.cmb_format,
-                &["PNG（无损清晰，推荐）", "JPEG（体积小）", "BMP（原始位图）"],
-                cfg.save_format.index(),
-            );
-            list.push(self.controls.cmb_format);
-            y += s(34);
-
-            self.controls.chk_quick_save = self.create_child(
-                "BUTTON",
-                "点击「保存」时直接存入默认目录（跳过另存为弹窗）",
-                (WS_CHILD | WS_TABSTOP).0 | BS_AUTOCHECKBOX as u32,
-                0,
-                left,
-                y,
-                inner_w,
-                s(24),
-                ID_CHK_QUICK_SAVE,
-                false,
-            );
-            set_checked(self.controls.chk_quick_save, cfg.quick_save_no_dialog);
-            list.push(self.controls.chk_quick_save);
-            y += s(36);
-
-            list.push(self.create_child(
-                "STATIC",
-                "贴图窗口行为",
-                (WS_CHILD).0,
-                0,
-                left,
-                y,
-                inner_w,
-                s(20),
-                0,
-                true,
-            ));
-            y += s(26);
-
-            list.push(self.create_child(
-                "STATIC",
-                "双击贴图动作：",
-                (WS_CHILD).0,
-                0,
-                left,
-                y + s(4),
-                s(108),
-                s(22),
-                0,
-                false,
-            ));
-            self.controls.cmb_pin_dblclk = self.create_child(
-                "COMBOBOX",
-                "",
-                (WS_CHILD | WS_TABSTOP | WS_VSCROLL).0 | CBS_DROPDOWNLIST as u32,
-                0,
-                left + s(112),
-                y,
-                s(280),
-                s(120),
-                ID_CMB_PIN_DBLCLK,
-                false,
-            );
-            combo_add(
-                self.controls.cmb_pin_dblclk,
-                &[
-                    "隐藏贴图（自动压缩省内存，随时恢复）",
-                    "重置为 100% 原始尺寸",
-                    "直接关闭贴图",
-                ],
-                cfg.pin_double_click.index(),
-            );
-            list.push(self.controls.cmb_pin_dblclk);
-            y += s(34);
-
-            self.controls.chk_pin_border = self.create_child(
-                "BUTTON",
-                "为贴图绘制 1px 细边框（防止白底截图融入背景）",
-                (WS_CHILD | WS_TABSTOP).0 | BS_AUTOCHECKBOX as u32,
-                0,
-                left,
-                y,
-                inner_w,
-                s(24),
-                ID_CHK_PIN_BORDER,
-                false,
-            );
-            set_checked(self.controls.chk_pin_border, cfg.pin_show_border);
-            list.push(self.controls.chk_pin_border);
-            y += s(38);
-
-            list.push(self.create_child(
-                "STATIC",
-                "实时资源与贴图管理",
-                (WS_CHILD).0,
-                0,
-                left,
-                y,
-                inner_w,
-                s(20),
-                0,
-                true,
-            ));
-            y += s(24);
-
-            self.controls.mem_stats = self.create_child(
-                "STATIC",
-                "内存统计加载中…",
-                (WS_CHILD).0,
-                0,
-                left,
-                y,
-                inner_w,
-                s(22),
-                ID_LBL_MEM_STATS,
-                false,
-            );
-            list.push(self.controls.mem_stats);
-            y += s(30);
-
-            list.push(self.create_child(
-                "BUTTON",
-                "隐藏全部贴图",
-                (WS_CHILD | WS_TABSTOP).0 | BS_PUSHBUTTON as u32,
-                0,
-                left,
-                y,
-                s(110),
-                s(28),
-                ID_BTN_HIDE_PINS,
-                false,
-            ));
-            list.push(self.create_child(
-                "BUTTON",
-                "显示全部贴图",
-                (WS_CHILD | WS_TABSTOP).0 | BS_PUSHBUTTON as u32,
-                0,
-                left + s(120),
-                y,
-                s(110),
-                s(28),
-                ID_BTN_SHOW_PINS,
-                false,
-            ));
-            list.push(self.create_child(
-                "BUTTON",
-                "关闭全部贴图",
-                (WS_CHILD | WS_TABSTOP).0 | BS_PUSHBUTTON as u32,
-                0,
-                left + s(240),
-                y,
-                s(110),
-                s(28),
-                ID_BTN_CLOSE_PINS,
-                false,
-            ));
-
-            self.tab_controls[1] = list;
-        }
-
-        // ==================== TAB 2: 更新设置 ====================
-        {
-            let mut list = Vec::new();
-            let mut y = top;
-
-            self.controls.lbl_version = self.create_child(
-                "STATIC",
-                &format!("当前版本：v{APP_VERSION}"),
-                (WS_CHILD).0,
-                0,
-                left,
-                y,
-                inner_w,
-                s(22),
-                ID_LBL_VERSION,
-                true,
-            );
-            list.push(self.controls.lbl_version);
-            y += s(28);
-
-            list.push(self.create_child(
-                "STATIC",
-                "首选更新源：",
-                (WS_CHILD).0,
-                0,
-                left,
-                y + s(4),
-                s(98),
-                s(22),
-                0,
-                false,
-            ));
-            self.controls.cmb_update_src = self.create_child(
-                "COMBOBOX",
-                "",
-                (WS_CHILD | WS_TABSTOP | WS_VSCROLL).0 | CBS_DROPDOWNLIST as u32,
-                0,
-                left + s(102),
-                y,
-                s(290),
-                s(100),
-                ID_CMB_UPDATE_SRC,
-                false,
-            );
-            combo_add(
-                self.controls.cmb_update_src,
-                &[
-                    "优先 CNB（失败自动回退 GitHub）",
-                    "优先 GitHub（失败自动回退 CNB）",
-                ],
-                cfg.update.preferred_source.index(),
-            );
-            list.push(self.controls.cmb_update_src);
-            y += s(32);
-
-            list.push(self.create_child(
-                "STATIC",
-                "CNB 地址：",
-                (WS_CHILD).0,
-                0,
-                left,
-                y + s(4),
-                s(98),
-                s(22),
-                0,
-                false,
-            ));
-            self.controls.edit_cnb_url = self.create_child(
-                "EDIT",
-                &cfg.update.cnb_url,
-                (WS_CHILD | WS_TABSTOP | WS_BORDER).0 | ES_AUTOHSCROLL as u32,
-                WS_EX_CLIENTEDGE.0,
-                left + s(102),
-                y,
-                inner_w - s(102),
-                s(24),
-                ID_EDIT_CNB_URL,
-                false,
-            );
-            list.push(self.controls.edit_cnb_url);
-            y += s(30);
-
-            list.push(self.create_child(
-                "STATIC",
-                "GitHub 地址：",
-                (WS_CHILD).0,
-                0,
-                left,
-                y + s(4),
-                s(98),
-                s(22),
-                0,
-                false,
-            ));
-            self.controls.edit_github_url = self.create_child(
-                "EDIT",
-                &cfg.update.github_url,
-                (WS_CHILD | WS_TABSTOP | WS_BORDER).0 | ES_AUTOHSCROLL as u32,
-                WS_EX_CLIENTEDGE.0,
-                left + s(102),
-                y,
-                inner_w - s(102),
-                s(24),
-                ID_EDIT_GITHUB_URL,
-                false,
-            );
-            list.push(self.controls.edit_github_url);
-            y += s(32);
-
-            // Proxy row
-            self.controls.chk_proxy = self.create_child(
-                "BUTTON",
-                "更新代理",
-                (WS_CHILD | WS_TABSTOP).0 | BS_AUTOCHECKBOX as u32,
-                0,
-                left,
-                y + s(2),
-                s(88),
-                s(22),
-                ID_CHK_PROXY,
-                false,
-            );
-            set_checked(self.controls.chk_proxy, cfg.update.proxy.enabled);
-            list.push(self.controls.chk_proxy);
-
-            self.controls.cmb_proxy_proto = self.create_child(
-                "COMBOBOX",
-                "",
-                (WS_CHILD | WS_TABSTOP | WS_VSCROLL).0 | CBS_DROPDOWNLIST as u32,
-                0,
-                left + s(102),
-                y,
-                s(76),
-                s(90),
-                ID_CMB_PROXY_PROTO,
-                false,
-            );
-            combo_add(
-                self.controls.cmb_proxy_proto,
-                &["http", "https"],
-                if cfg.update.proxy.protocol == "https" { 1 } else { 0 },
-            );
-            list.push(self.controls.cmb_proxy_proto);
-
-            self.controls.edit_proxy_host = self.create_child(
-                "EDIT",
-                &cfg.update.proxy.host,
-                (WS_CHILD | WS_TABSTOP | WS_BORDER).0 | ES_AUTOHSCROLL as u32,
-                WS_EX_CLIENTEDGE.0,
-                left + s(186),
-                y,
-                s(180),
-                s(24),
-                ID_EDIT_PROXY_HOST,
-                false,
-            );
-            list.push(self.controls.edit_proxy_host);
-
-            self.controls.edit_proxy_port = self.create_child(
-                "EDIT",
-                &cfg.update.proxy.port.to_string(),
-                (WS_CHILD | WS_TABSTOP | WS_BORDER).0 | ES_AUTOHSCROLL as u32,
-                WS_EX_CLIENTEDGE.0,
-                left + s(374),
-                y,
-                s(72),
-                s(24),
-                ID_EDIT_PROXY_PORT,
-                false,
-            );
-            list.push(self.controls.edit_proxy_port);
-            y += s(30);
-
-            self.controls.chk_auto_update = self.create_child(
-                "BUTTON",
-                "启动时自动检查更新",
-                (WS_CHILD | WS_TABSTOP).0 | BS_AUTOCHECKBOX as u32,
-                0,
-                left,
-                y,
-                s(220),
-                s(22),
-                ID_CHK_AUTO_UPDATE,
-                false,
-            );
-            set_checked(self.controls.chk_auto_update, cfg.update.auto_check_on_start);
-            list.push(self.controls.chk_auto_update);
-            y += s(30);
-
-            // Action buttons
-            self.controls.btn_update_primary = self.create_child(
-                "BUTTON",
-                "检查更新",
-                (WS_CHILD | WS_TABSTOP).0 | BS_PUSHBUTTON as u32,
-                0,
-                left,
-                y,
-                s(160),
-                s(28),
-                ID_BTN_UPDATE_PRIMARY,
-                true,
-            );
-            list.push(self.controls.btn_update_primary);
-
-            self.controls.btn_update_check = self.create_child(
-                "BUTTON",
-                "重新检查",
-                (WS_CHILD | WS_TABSTOP).0 | BS_PUSHBUTTON as u32,
-                0,
-                left + s(170),
-                y,
-                s(90),
-                s(28),
-                ID_BTN_UPDATE_CHECK,
-                false,
-            );
-            list.push(self.controls.btn_update_check);
-
-            self.controls.btn_update_cancel = self.create_child(
-                "BUTTON",
-                "取消",
-                (WS_CHILD | WS_TABSTOP).0 | BS_PUSHBUTTON as u32,
-                0,
-                left + s(270),
-                y,
-                s(76),
-                s(28),
-                ID_BTN_UPDATE_CANCEL,
-                false,
-            );
-            list.push(self.controls.btn_update_cancel);
-            y += s(34);
-
-            // Progress bar
-            let prog_class = from_wide(unsafe { PROGRESS_CLASSW.as_wide() });
-            self.controls.progress_update = self.create_child(
-                &prog_class,
-                "",
-                (WS_CHILD).0,
-                0,
-                left,
-                y,
-                inner_w,
-                s(16),
-                ID_PROGRESS_UPDATE,
-                false,
-            );
-            unsafe {
-                let _ = SendMessageW(
-                    self.controls.progress_update,
-                    PBM_SETRANGE32,
-                    Some(WPARAM(0)),
-                    Some(LPARAM(100)),
-                );
-            }
-            list.push(self.controls.progress_update);
-            y += s(22);
-
-            self.controls.lbl_update_status = self.create_child(
-                "STATIC",
-                "尚未检查更新",
-                (WS_CHILD).0,
-                0,
-                left,
-                y,
-                inner_w,
-                s(34),
-                ID_LBL_UPDATE_STATUS,
-                false,
-            );
-            list.push(self.controls.lbl_update_status);
-            y += s(36);
-
-            let notes_h = (pad + tab_h - s(14) - y).max(s(65));
-            self.controls.edit_update_notes = self.create_child(
-                "EDIT",
-                "",
-                (WS_CHILD | WS_BORDER | WS_VSCROLL).0
-                    | ES_MULTILINE as u32
-                    | ES_READONLY as u32
-                    | ES_WANTRETURN as u32,
-                WS_EX_CLIENTEDGE.0,
-                left,
-                y,
-                inner_w,
-                notes_h,
-                ID_EDIT_UPDATE_NOTES,
-                false,
-            );
-            unsafe {
-                let _ = SendMessageW(self.controls.edit_update_notes, EM_SETREADONLY, Some(WPARAM(1)), None);
-            }
-            list.push(self.controls.edit_update_notes);
-
-            self.tab_controls[2] = list;
-        }
+    // Shared layout geometry for embedded EDIT controls (so paint frames and HWND bounds match 1:1!)
+    fn save_dir_box(&self) -> RectI {
+        let content_x = self.s(190) + self.s(26);
+        let content_r = self.client_w - self.s(26);
+        let card_l = content_x + self.s(16);
+        let browse_w = self.s(74);
+        let box_r = content_r - self.s(16) - browse_w - self.s(8);
+        RectI::new(card_l, self.s(118), box_r, self.s(150))
     }
 
-    fn switch_tab(&self, index: usize) {
-        let target = index.min(2);
-        self.active_tab.set(target);
+    fn cnb_url_box(&self) -> RectI {
+        let content_x = self.s(190) + self.s(26);
+        let content_r = self.client_w - self.s(26);
+        RectI::new(
+            content_x + self.s(96),
+            self.s(272),
+            content_r - self.s(16),
+            self.s(302),
+        )
+    }
+
+    fn github_url_box(&self) -> RectI {
+        let content_x = self.s(190) + self.s(26);
+        let content_r = self.client_w - self.s(26);
+        RectI::new(
+            content_x + self.s(96),
+            self.s(312),
+            content_r - self.s(16),
+            self.s(342),
+        )
+    }
+
+    fn proxy_host_box(&self) -> RectI {
+        let content_x = self.s(190) + self.s(26);
+        let content_r = self.client_w - self.s(26);
+        let port_w = self.s(68);
+        let host_l = content_x + self.s(246);
+        let host_r = content_r - self.s(16) - port_w - self.s(8);
+        RectI::new(host_l, self.s(354), host_r, self.s(384))
+    }
+
+    fn proxy_port_box(&self) -> RectI {
+        let content_r = self.client_w - self.s(26);
+        let port_w = self.s(68);
+        RectI::new(
+            content_r - self.s(16) - port_w,
+            self.s(354),
+            content_r - self.s(16),
+            self.s(384),
+        )
+    }
+
+    fn notes_box(&self) -> RectI {
+        let content_x = self.s(190) + self.s(26);
+        let content_r = self.client_w - self.s(26);
+        RectI::new(
+            content_x + self.s(14),
+            self.s(438),
+            content_r - self.s(14),
+            self.client_h - self.s(26),
+        )
+    }
+
+    fn inset_edit(&self, outer: RectI) -> RectI {
+        let px = self.s(10);
+        let py = self.s(6);
+        RectI::new(outer.left + px, outer.top + py, outer.right - px, outer.bottom - py)
+    }
+
+    fn create_embedded_edits(&mut self, cfg: &AppConfig) {
+        self.edits.save_dir = self.create_borderless_edit(
+            &cfg.save_dir,
+            ID_EDIT_SAVE_DIR,
+            self.inset_edit(self.save_dir_box()),
+        );
+        self.edits.cnb_url = self.create_borderless_edit(
+            &cfg.update.cnb_url,
+            ID_EDIT_CNB_URL,
+            self.inset_edit(self.cnb_url_box()),
+        );
+        self.edits.github_url = self.create_borderless_edit(
+            &cfg.update.github_url,
+            ID_EDIT_GITHUB_URL,
+            self.inset_edit(self.github_url_box()),
+        );
+        self.edits.proxy_host = self.create_borderless_edit(
+            &cfg.update.proxy.host,
+            ID_EDIT_PROXY_HOST,
+            self.inset_edit(self.proxy_host_box()),
+        );
+        self.edits.proxy_port = self.create_borderless_edit(
+            &cfg.update.proxy.port.to_string(),
+            ID_EDIT_PROXY_PORT,
+            self.inset_edit(self.proxy_port_box()),
+        );
+        // Set subtle cue banners when fields are empty
+        const EM_SETCUEBANNER: u32 = 0x1501;
+        let host_hint = to_wide("127.0.0.1");
+        let port_hint = to_wide("7890");
         unsafe {
             let _ = SendMessageW(
-                self.tab_ctrl,
-                TCM_SETCURSEL,
-                Some(WPARAM(target)),
-                None,
+                self.edits.proxy_host,
+                EM_SETCUEBANNER,
+                Some(WPARAM(1)),
+                Some(LPARAM(host_hint.as_ptr() as isize)),
+            );
+            let _ = SendMessageW(
+                self.edits.proxy_port,
+                EM_SETCUEBANNER,
+                Some(WPARAM(1)),
+                Some(LPARAM(port_hint.as_ptr() as isize)),
             );
         }
-        for (i, group) in self.tab_controls.iter().enumerate() {
-            let cmd = if i == target { SW_SHOW } else { SW_HIDE };
-            for &ctrl in group {
-                unsafe {
-                    let _ = ShowWindow(ctrl, cmd);
-                }
-            }
-        }
+    }
+
+    fn update_edit_visibility(&self) {
+        let tab = self.active_tab.get();
+        let tab1_cmd = if tab == 1 { SW_SHOW } else { SW_HIDE };
+        let tab2_cmd = if tab == 2 { SW_SHOW } else { SW_HIDE };
         unsafe {
-            let _ = InvalidateRect(Some(self.hwnd), None, true);
+            let _ = ShowWindow(self.edits.save_dir, tab1_cmd);
+            let _ = ShowWindow(self.edits.cnb_url, tab2_cmd);
+            let _ = ShowWindow(self.edits.github_url, tab2_cmd);
+            let _ = ShowWindow(self.edits.proxy_host, tab2_cmd);
+            let _ = ShowWindow(self.edits.proxy_port, tab2_cmd);
         }
     }
 
-    fn refresh_memory_stats(&self) {
-        let mem = process_memory_mb();
-        let (vis, hid) = pin::pin_counts();
-        let text = format!(
-            "当前内存：{mem:.1} MB  |  显存占用：0 MB（纯 CPU）  |  显示中贴图：{vis}  |  已隐藏：{hid}"
-        );
-        set_text(self.controls.mem_stats, &text);
+    fn switch_tab(&self, tab: usize) {
+        self.cancel_recording();
+        self.flush_pending_autosave();
+        self.active_tab.set(tab.min(2));
+        self.hovered.set(None);
+        self.update_edit_visibility();
+        if tab == 2 {
+            self.sync_update_notes_edit();
+        }
+        self.request_repaint();
     }
 
-    fn refresh_update_ui(&self) {
-        let snap = self.updater.snapshot();
-        let mode_desc = if snap.managed {
-            "Velopack 增量更新已启用"
-        } else {
-            "独立运行模式（支持检查更新；使用 Velopack 安装包可自动增量更新）"
-        };
-        set_text(
-            self.controls.lbl_version,
-            &format!("当前版本：v{} — {mode_desc}", snap.current_version),
-        );
-        set_text(self.controls.btn_update_primary, &snap.primary_button_label());
-        set_text(self.controls.lbl_update_status, &snap.status);
+    fn sync_update_notes_edit(&self) {
+        self.notes_scroll.set(0);
+    }
 
-        let notes_display = if snap.notes.trim().is_empty() {
+    fn current_release_notes_text(&self) -> String {
+        let snap = self.updater.snapshot();
+        if snap.notes.trim().is_empty() {
             if let Some(ver) = &snap.available_version {
                 format!("版本 v{ver} 未附带更新日志。")
             } else {
-                "检查更新后将在此显示版本更新日志。\r\n\r\n提示：支持直接填写 CNB（https://cnb.cool/用户名/仓库）或 GitHub（https://github.com/用户名/仓库）地址，自动读取 releases.win.json 并优先走增量差分包更新。".into()
+                "点击「检查更新」后将在此展示版本更新日志。\n\n• 支持自定义 CNB / GitHub 仓库地址，自动读取 releases.win.json\n• 安装版自动走 Velopack 增量差分包（*-delta.nupkg）并弹出独立过渡更新界面".into()
             }
         } else {
-            snap.notes.replace("\r\n", "\n").replace('\n', "\r\n")
-        };
-        set_text(self.controls.edit_update_notes, &notes_display);
-
-        unsafe {
-            let _ = EnableWindow(self.controls.btn_update_primary, !snap.busy);
-            let _ = EnableWindow(self.controls.btn_update_check, !snap.busy);
-            let _ = EnableWindow(self.controls.btn_update_cancel, snap.busy && snap.cancellable);
-            let _ = SendMessageW(
-                self.controls.progress_update,
-                PBM_SETPOS,
-                Some(WPARAM(snap.progress.clamp(0, 100) as usize)),
-                None,
-            );
+            snap.notes.replace("\r\n", "\n")
         }
     }
 
-    fn collect_config(&self) -> Result<AppConfig, String> {
-        let normalize_hk = |hwnd: HWND| -> Result<String, String> {
-            let raw = get_text(hwnd);
-            match HotkeySpec::parse(&raw)? {
-                Some(spec) => Ok(spec.format()),
-                None => Ok(String::new()),
-            }
-        };
+    fn set_toast(&self, text: impl Into<String>, tone: ToastTone) {
+        *self.toast.borrow_mut() = (text.into(), tone);
+        self.request_repaint();
+    }
 
-        let proxy_port_text = get_text(self.controls.edit_proxy_port);
-        let proxy_enabled = is_checked(self.controls.chk_proxy);
-        let proxy_port = if proxy_enabled {
-            proxy_port_text
-                .trim()
-                .parse::<u16>()
-                .map_err(|_| "代理端口应为 1–65535".to_string())?
-        } else {
-            proxy_port_text.trim().parse::<u16>().unwrap_or(7890)
-        };
-
-        let proxy = ProxyConfig {
-            enabled: proxy_enabled,
-            protocol: if combo_sel(self.controls.cmb_proxy_proto) == 1 {
-                "https".into()
-            } else {
-                "http".into()
-            },
-            host: get_text(self.controls.edit_proxy_host).trim().into(),
-            port: proxy_port,
-        };
-        proxy.validate()?;
-
-        let cnb_url = get_text(self.controls.edit_cnb_url).trim().to_string();
-        let github_url = get_text(self.controls.edit_github_url).trim().to_string();
-        if !cnb_url.is_empty() {
-            crate::updater::normalize_mirror_url(&cnb_url, UpdateProvider::Cnb, false)?;
+    fn begin_recording(&self, slot: usize) {
+        self.recording_slot.set(Some(slot));
+        (self.callbacks.on_suspend_hotkeys)(true);
+        unsafe {
+            let _ = SetFocus(Some(self.hwnd));
         }
-        if !github_url.is_empty() {
-            crate::updater::normalize_mirror_url(&github_url, UpdateProvider::Github, false)?;
-        }
+        self.set_toast("请直接按下目标组合键（Backspace 清空 / Esc 取消）", ToastTone::Warning);
+    }
 
-        let mut cfg = AppConfig::default();
-        cfg.screenshot_hotkey = normalize_hk(self.controls.hk_shot)?;
-        cfg.pin_clipboard_hotkey = normalize_hk(self.controls.hk_pin)?;
-        cfg.toggle_pins_hotkey = normalize_hk(self.controls.hk_toggle)?;
-        cfg.auto_start = is_checked(self.controls.chk_autostart);
-        cfg.smart_window_detect = is_checked(self.controls.chk_smart_win);
-        cfg.show_magnifier = is_checked(self.controls.chk_magnifier);
-        cfg.save_dir = get_text(self.controls.save_dir).trim().into();
-        cfg.save_format = SaveFormat::from_index(combo_sel(self.controls.cmb_format));
-        cfg.quick_save_no_dialog = is_checked(self.controls.chk_quick_save);
-        cfg.pin_double_click =
-            PinDoubleClickAction::from_index(combo_sel(self.controls.cmb_pin_dblclk));
-        cfg.pin_show_border = is_checked(self.controls.chk_pin_border);
-        cfg.update.preferred_source =
-            UpdateProvider::from_index(combo_sel(self.controls.cmb_update_src));
-        cfg.update.cnb_url = cnb_url;
-        cfg.update.github_url = github_url;
-        cfg.update.auto_check_on_start = is_checked(self.controls.chk_auto_update);
-        cfg.update.proxy = proxy;
-        Ok(cfg)
+    fn cancel_recording(&self) {
+        if self.recording_slot.replace(None).is_some() {
+            (self.callbacks.on_suspend_hotkeys)(false);
+            self.request_repaint();
+        }
     }
 
     fn schedule_autosave(&self) {
@@ -1326,144 +682,1478 @@ impl SettingsWindow {
         }
     }
 
+    fn collect_and_sync_from_edits(&self) -> Result<AppConfig, String> {
+        let mut cfg = self.cfg.borrow().clone();
+        cfg.save_dir = get_text(self.edits.save_dir).trim().into();
+        let cnb_url = get_text(self.edits.cnb_url).trim().to_string();
+        let github_url = get_text(self.edits.github_url).trim().to_string();
+        if !cnb_url.is_empty() {
+            crate::updater::normalize_mirror_url(&cnb_url, UpdateProvider::Cnb, false)?;
+        }
+        if !github_url.is_empty() {
+            crate::updater::normalize_mirror_url(&github_url, UpdateProvider::Github, false)?;
+        }
+        cfg.update.cnb_url = cnb_url;
+        cfg.update.github_url = github_url;
+
+        let port_text = get_text(self.edits.proxy_port);
+        let port = if cfg.update.proxy.enabled {
+            port_text
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| "代理端口应为 1–65535".to_string())?
+        } else {
+            port_text.trim().parse::<u16>().unwrap_or(7890)
+        };
+        let proxy = ProxyConfig {
+            enabled: cfg.update.proxy.enabled,
+            protocol: cfg.update.proxy.protocol.clone(),
+            host: get_text(self.edits.proxy_host).trim().into(),
+            port,
+        };
+        proxy.validate()?;
+        cfg.update.proxy = proxy;
+        Ok(cfg)
+    }
+
     fn save_config(&self, quiet_invalid: bool) -> bool {
         self.pending_autosave.set(false);
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIMER_AUTOSAVE);
         }
-        let cfg = match self.collect_config() {
+        let cfg = match self.collect_and_sync_from_edits() {
             Ok(c) => c,
             Err(err) => {
-                let prefix = if quiet_invalid { "等待完善输入：" } else { "错误：" };
-                set_text(self.controls.footer_lbl, &format!("{prefix}{err}"));
+                if quiet_invalid {
+                    self.set_toast(format!("等待完善：{err}"), ToastTone::Warning);
+                } else {
+                    self.set_toast(format!("错误：{err}"), ToastTone::Error);
+                }
                 return false;
             }
         };
+        *self.cfg.borrow_mut() = cfg.clone();
+
         if let Err(err) = cfg.save() {
-            set_text(self.controls.footer_lbl, &format!("自动保存失败：{err}"));
+            self.set_toast(format!("保存失败：{err}"), ToastTone::Error);
             return false;
         }
         if let Err(err) = set_auto_start(cfg.auto_start) {
-            set_text(self.controls.footer_lbl, &format!("配置已保存，但自启设置失败：{err}"));
+            self.set_toast(format!("自启设置失败：{err}"), ToastTone::Error);
             return false;
         }
         self.updater.update_config(cfg.update.clone());
         let warnings = (self.callbacks.on_config_saved)(cfg);
         if warnings.is_empty() {
-            set_text(self.controls.footer_lbl, "已自动保存并立即生效");
+            self.set_toast("✓ 已自动保存", ToastTone::Success);
         } else {
-            set_text(self.controls.footer_lbl, &warnings.join("；"));
+            self.set_toast(warnings.join("；"), ToastTone::Warning);
         }
         true
     }
+
+    fn launch_preview_splash(&self) {
+        if let Ok(exe) = std::env::current_exe() {
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args([
+                "--update-splash",
+                "--from-version",
+                APP_VERSION,
+                "--to-version",
+                "0.2.0",
+                "--demo-ms",
+                "3600",
+            ])
+            .creation_flags(0x0800_0000);
+            let _ = cmd.spawn();
+        }
+    }
+
+    fn handle_click(&self, kind: HitKind) {
+        match kind {
+            HitKind::NavTab(t) => self.switch_tab(t),
+            HitKind::HotkeyRecord(slot) => self.begin_recording(slot),
+            HitKind::HotkeyClear(slot) => {
+                self.cancel_recording();
+                {
+                    let mut cfg = self.cfg.borrow_mut();
+                    match slot {
+                        0 => cfg.screenshot_hotkey.clear(),
+                        1 => cfg.pin_clipboard_hotkey.clear(),
+                        _ => cfg.toggle_pins_hotkey.clear(),
+                    }
+                }
+                self.save_config(false);
+            }
+            HitKind::ToggleAutoStart => {
+                self.cfg.borrow_mut().auto_start ^= true;
+                self.save_config(false);
+            }
+            HitKind::ToggleSmartWin => {
+                self.cfg.borrow_mut().smart_window_detect ^= true;
+                self.save_config(false);
+            }
+            HitKind::ToggleMagnifier => {
+                self.cfg.borrow_mut().show_magnifier ^= true;
+                self.save_config(false);
+            }
+            HitKind::BrowseSaveDir => {
+                if let Some(dir) = browse_folder_dialog(Some(self.hwnd)) {
+                    let text = dir.to_string_lossy().into_owned();
+                    set_text(self.edits.save_dir, &text);
+                    self.cfg.borrow_mut().save_dir = text;
+                    self.save_config(false);
+                }
+            }
+            HitKind::FormatSeg(idx) => {
+                self.cfg.borrow_mut().save_format = SaveFormat::from_index(idx);
+                self.save_config(false);
+            }
+            HitKind::ToggleQuickSave => {
+                self.cfg.borrow_mut().quick_save_no_dialog ^= true;
+                self.save_config(false);
+            }
+            HitKind::PinDblClkSeg(idx) => {
+                self.cfg.borrow_mut().pin_double_click = PinDoubleClickAction::from_index(idx);
+                self.save_config(false);
+            }
+            HitKind::TogglePinBorder => {
+                self.cfg.borrow_mut().pin_show_border ^= true;
+                self.save_config(false);
+            }
+            HitKind::HideAllPins => {
+                pin::hide_all_pins();
+                self.request_repaint();
+            }
+            HitKind::ShowAllPins => {
+                pin::show_all_pins();
+                self.request_repaint();
+            }
+            HitKind::CloseAllPins => {
+                pin::close_all_pins();
+                self.request_repaint();
+            }
+            HitKind::UpdatePrimary => {
+                if self.save_config(false) {
+                    let updater = self.updater.clone();
+                    let on_exit = self.callbacks.on_exit_for_update.clone();
+                    updater.start_download_or_install_async(on_exit);
+                }
+            }
+            HitKind::UpdateRecheck => {
+                if self.save_config(false) {
+                    self.updater.start_check_async();
+                }
+            }
+            HitKind::UpdateCancel => {
+                self.updater.cancel();
+            }
+            HitKind::UpdatePreviewSplash => {
+                self.launch_preview_splash();
+            }
+            HitKind::UpdateSourceSeg(idx) => {
+                self.cfg.borrow_mut().update.preferred_source = UpdateProvider::from_index(idx);
+                self.save_config(false);
+            }
+            HitKind::ToggleAutoCheck => {
+                self.cfg.borrow_mut().update.auto_check_on_start ^= true;
+                self.save_config(false);
+            }
+            HitKind::ToggleProxy => {
+                self.cfg.borrow_mut().update.proxy.enabled ^= true;
+                self.save_config(false);
+            }
+            HitKind::ProxyProtoSeg(idx) => {
+                self.cfg.borrow_mut().update.proxy.protocol =
+                    if idx == 1 { "https".into() } else { "http".into() };
+                self.save_config(false);
+            }
+        }
+    }
+
+    fn render_to_surface(&self, surface: &mut DibSurface) {
+        let w = surface.width;
+        let h = surface.height;
+        let sf = self.sf();
+        let s = |v: i32| scale_dpi(v, self.dpi);
+        let sidebar_w = s(190);
+        let content_x = sidebar_w + self.s(26);
+        let content_r = w - self.s(26);
+        let content_w = content_r - content_x;
+
+        let mut hits = Vec::new();
+        let mut texts: Vec<(String, RectI, (u8, u8, u8), FontSlot, u32)> = Vec::new();
+
+        let cfg = self.cfg.borrow().clone();
+        let active_tab = self.active_tab.get();
+        let hovered = self.hovered.get();
+        let recording = self.recording_slot.get();
+        let focused_edit = self.focused_edit.get();
+
+        if let Some(mut pm) = Pixmap::new(w as u32, h as u32) {
+            // 1. Canvas backgrounds: deeper obsidian sidebar (#0B1120) + modern slate content (#0F172A)
+            fill_rect(&mut pm, 0.0, 0.0, sidebar_w as f32, h as f32, Color::from_rgba8(11, 17, 32, 255));
+            fill_rect(
+                &mut pm,
+                sidebar_w as f32,
+                0.0,
+                (w - sidebar_w) as f32,
+                h as f32,
+                Color::from_rgba8(15, 23, 42, 255),
+            );
+            // Hairline vertical divider between sidebar and content
+            fill_rect(
+                &mut pm,
+                sidebar_w as f32,
+                0.0,
+                (1.0 * sf).max(1.0),
+                h as f32,
+                Color::from_rgba8(255, 255, 255, 18),
+            );
+
+            // 2. Sidebar Brand Header
+            draw_rhpicture_emblem(&mut pm, 18.0 * sf, 20.0 * sf, 34.0 * sf);
+            texts.push((
+                "RHPicture".into(),
+                RectI::new(s(62), s(18), sidebar_w - s(10), s(40)),
+                (248, 250, 252),
+                FontSlot::Brand,
+                DT_LEFT.0,
+            ));
+            texts.push((
+                format!("v{APP_VERSION} · 极简截图"),
+                RectI::new(s(62), s(38), sidebar_w - s(10), s(56)),
+                (100, 116, 139),
+                FontSlot::Small,
+                DT_LEFT.0,
+            ));
+
+            // 3. Sidebar Navigation Pills
+            let nav_items = [(0, "快捷键与常规"), (1, "贴图与保存"), (2, "检查与更新")];
+            for (idx, label) in nav_items {
+                let ny = s(84) + (idx as i32) * s(44);
+                let rect = RectI::new(s(12), ny, sidebar_w - s(12), ny + s(38));
+                let kind = HitKind::NavTab(idx);
+                hits.push(HitZone { rect, kind });
+                let is_active = active_tab == idx;
+                let is_hover = hovered == Some(kind);
+
+                if is_active {
+                    fill_rrect(
+                        &mut pm,
+                        rect.left as f32,
+                        rect.top as f32,
+                        rect.width() as f32,
+                        rect.height() as f32,
+                        9.0 * sf,
+                        Color::from_rgba8(56, 189, 248, 32),
+                    );
+                    // Glowing vertical indicator bar
+                    fill_rrect(
+                        &mut pm,
+                        rect.left as f32 + 2.0 * sf,
+                        rect.top as f32 + 9.0 * sf,
+                        3.0 * sf,
+                        rect.height() as f32 - 18.0 * sf,
+                        1.5 * sf,
+                        Color::from_rgba8(56, 189, 248, 255),
+                    );
+                } else if is_hover {
+                    fill_rrect(
+                        &mut pm,
+                        rect.left as f32,
+                        rect.top as f32,
+                        rect.width() as f32,
+                        rect.height() as f32,
+                        9.0 * sf,
+                        Color::from_rgba8(255, 255, 255, 12),
+                    );
+                }
+
+                let icon_col = if is_active {
+                    Color::from_rgba8(56, 189, 248, 255)
+                } else {
+                    Color::from_rgba8(148, 163, 184, 255)
+                };
+                draw_nav_icon(
+                    &mut pm,
+                    idx,
+                    rect.left as f32 + 14.0 * sf,
+                    rect.top as f32 + 11.0 * sf,
+                    sf,
+                    icon_col,
+                );
+                let txt_col = if is_active {
+                    (248, 250, 252)
+                } else if is_hover {
+                    (226, 232, 240)
+                } else {
+                    (148, 163, 184)
+                };
+                texts.push((
+                    label.into(),
+                    RectI::new(rect.left + s(38), rect.top, rect.right - s(8), rect.bottom),
+                    txt_col,
+                    if is_active { FontSlot::BodyBold } else { FontSlot::Body },
+                    DT_LEFT.0,
+                ));
+            }
+
+            // 4. Sidebar Bottom Live Zero-VRAM Resource Card
+            let res_rect = RectI::new(s(12), h - s(106), sidebar_w - s(12), h - s(16));
+            draw_card(&mut pm, res_rect, 10.0 * sf, sf, Color::from_rgba8(18, 27, 45, 255));
+            if let Some(dot) = PathBuilder::from_circle(
+                (res_rect.left + s(16)) as f32,
+                (res_rect.top + s(18)) as f32,
+                3.5 * sf,
+            ) {
+                let mut p = Paint::default();
+                p.set_color(Color::from_rgba8(52, 211, 153, 255));
+                p.anti_alias = true;
+                pm.fill_path(&dot, &p, FillRule::Winding, Transform::identity(), None);
+            }
+            let mem = process_memory_mb();
+            let (vis, hid) = pin::pin_counts();
+            texts.push((
+                "零显存引擎".into(),
+                RectI::new(res_rect.left + s(26), res_rect.top + s(8), res_rect.right - s(8), res_rect.top + s(28)),
+                (52, 211, 153),
+                FontSlot::Small,
+                DT_LEFT.0,
+            ));
+            texts.push((
+                format!("内存 {mem:.1} MB · 显存 0 MB"),
+                RectI::new(res_rect.left + s(12), res_rect.top + s(34), res_rect.right - s(8), res_rect.top + s(54)),
+                (203, 213, 225),
+                FontSlot::Small,
+                DT_LEFT.0,
+            ));
+            texts.push((
+                format!("贴图：{vis} 显示 / {hid} 隐藏"),
+                RectI::new(res_rect.left + s(12), res_rect.top + s(56), res_rect.right - s(8), res_rect.top + s(78)),
+                (148, 163, 184),
+                FontSlot::Small,
+                DT_LEFT.0,
+            ));
+
+            // 5. Right Content Header + Auto-Save Status Pill
+            let page_title = match active_tab {
+                0 => "快捷键与常规",
+                1 => "贴图与保存",
+                _ => "检查与更新",
+            };
+            texts.push((
+                page_title.into(),
+                RectI::new(content_x, s(18), content_x + s(220), s(52)),
+                (248, 250, 252),
+                FontSlot::H1,
+                DT_LEFT.0,
+            ));
+
+            let (toast_txt, toast_tone) = self.toast.borrow().clone();
+            if !toast_txt.is_empty() {
+                let (bg, fg, border) = match toast_tone {
+                    ToastTone::Muted => (
+                        Color::from_rgba8(255, 255, 255, 12),
+                        (148, 163, 184),
+                        Color::from_rgba8(255, 255, 255, 20),
+                    ),
+                    ToastTone::Success => (
+                        Color::from_rgba8(16, 185, 129, 28),
+                        (52, 211, 153),
+                        Color::from_rgba8(52, 211, 153, 85),
+                    ),
+                    ToastTone::Warning => (
+                        Color::from_rgba8(245, 158, 11, 28),
+                        (251, 191, 36),
+                        Color::from_rgba8(251, 191, 36, 90),
+                    ),
+                    ToastTone::Error => (
+                        Color::from_rgba8(244, 63, 94, 28),
+                        (251, 113, 133),
+                        Color::from_rgba8(244, 63, 94, 95),
+                    ),
+                };
+                let pill_w = ((toast_txt.chars().count() as i32) * s(11) + s(24))
+                    .clamp(s(100), content_w - s(170));
+                let pill = RectI::new(content_r - pill_w, s(22), content_r, s(48));
+                fill_rrect(
+                    &mut pm,
+                    pill.left as f32,
+                    pill.top as f32,
+                    pill.width() as f32,
+                    pill.height() as f32,
+                    13.0 * sf,
+                    bg,
+                );
+                stroke_rrect(
+                    &mut pm,
+                    pill.left as f32 + 0.5 * sf,
+                    pill.top as f32 + 0.5 * sf,
+                    pill.width() as f32 - sf,
+                    pill.height() as f32 - sf,
+                    12.5 * sf,
+                    1.0 * sf,
+                    border,
+                );
+                texts.push((
+                    toast_txt,
+                    RectI::new(pill.left + s(10), pill.top, pill.right - s(10), pill.bottom),
+                    fg,
+                    FontSlot::Small,
+                    DT_CENTER.0 | DT_END_ELLIPSIS.0,
+                ));
+            }
+
+            // 6. Active Page Body
+            match active_tab {
+                0 => {
+                    // --- Section: Global Hotkeys ---
+                    texts.push((
+                        "全局快捷键".into(),
+                        RectI::new(content_x + s(2), s(66), content_r, s(86)),
+                        (148, 163, 184),
+                        FontSlot::Section,
+                        DT_LEFT.0,
+                    ));
+                    let hk_card = RectI::new(content_x, s(88), content_r, s(238));
+                    draw_card(&mut pm, hk_card, 11.0 * sf, sf, Color::from_rgba8(22, 32, 50, 255));
+
+                    let hk_rows = [
+                        (0usize, "开始截图", "全局唤起多屏截图选区", cfg.screenshot_hotkey.as_str()),
+                        (1usize, "剪贴板贴图", "将剪贴板图片直接钉到屏幕上", cfg.pin_clipboard_hotkey.as_str()),
+                        (2usize, "隐藏 / 显示全部贴图", "一键切换所有贴图的显示与隐藏", cfg.toggle_pins_hotkey.as_str()),
+                    ];
+                    for (idx, title, desc, val) in hk_rows {
+                        let ry = hk_card.top + (idx as i32) * s(50);
+                        if idx > 0 {
+                            draw_divider(&mut pm, hk_card.left + s(16), ry, hk_card.right - s(16), sf);
+                        }
+                        texts.push((
+                            title.into(),
+                            RectI::new(hk_card.left + s(16), ry + s(7), hk_card.left + s(260), ry + s(27)),
+                            (241, 245, 249),
+                            FontSlot::BodyBold,
+                            DT_LEFT.0,
+                        ));
+                        texts.push((
+                            desc.into(),
+                            RectI::new(hk_card.left + s(16), ry + s(26), hk_card.left + s(270), ry + s(44)),
+                            (148, 163, 184),
+                            FontSlot::Small,
+                            DT_LEFT.0,
+                        ));
+
+                        let clr_rect = RectI::new(hk_card.right - s(40), ry + s(11), hk_card.right - s(14), ry + s(39));
+                        let key_rect = RectI::new(clr_rect.left - s(142), ry + s(11), clr_rect.left - s(8), ry + s(39));
+                        hits.push(HitZone { rect: key_rect, kind: HitKind::HotkeyRecord(idx) });
+                        hits.push(HitZone { rect: clr_rect, kind: HitKind::HotkeyClear(idx) });
+
+                        let is_rec = recording == Some(idx);
+                        let is_hov = hovered == Some(HitKind::HotkeyRecord(idx));
+                        let kbg = if is_rec {
+                            Color::from_rgba8(14, 165, 233, 42)
+                        } else if is_hov {
+                            Color::from_rgba8(30, 41, 59, 255)
+                        } else {
+                            Color::from_rgba8(14, 22, 39, 255)
+                        };
+                        let kborder = if is_rec {
+                            Color::from_rgba8(56, 189, 248, 255)
+                        } else if is_hov {
+                            Color::from_rgba8(71, 85, 105, 255)
+                        } else {
+                            Color::from_rgba8(42, 56, 82, 255)
+                        };
+                        fill_rrect(&mut pm, key_rect.left as f32, key_rect.top as f32, key_rect.width() as f32, key_rect.height() as f32, 7.0 * sf, kbg);
+                        stroke_rrect(&mut pm, key_rect.left as f32 + 0.5 * sf, key_rect.top as f32 + 0.5 * sf, key_rect.width() as f32 - sf, key_rect.height() as f32 - sf, 6.5 * sf, if is_rec { 1.5 * sf } else { 1.0 * sf }, kborder);
+
+                        let display = if is_rec {
+                            "请按键…".to_string()
+                        } else if val.trim().is_empty() {
+                            "未设置".to_string()
+                        } else {
+                            val.to_string()
+                        };
+                        let txt_c = if is_rec {
+                            (125, 211, 252)
+                        } else if val.trim().is_empty() {
+                            (100, 116, 139)
+                        } else {
+                            (248, 250, 252)
+                        };
+                        texts.push((display, key_rect, txt_c, FontSlot::BodyBold, DT_CENTER.0));
+
+                        // Subtle × clear button
+                        let clr_hov = hovered == Some(HitKind::HotkeyClear(idx));
+                        if clr_hov {
+                            fill_rrect(&mut pm, clr_rect.left as f32, clr_rect.top as f32, clr_rect.width() as f32, clr_rect.height() as f32, 6.0 * sf, Color::from_rgba8(244, 63, 94, 40));
+                        }
+                        texts.push((
+                            "×".into(),
+                            clr_rect,
+                            if clr_hov { (251, 113, 133) } else { (100, 116, 139) },
+                            FontSlot::BodyBold,
+                            DT_CENTER.0,
+                        ));
+                    }
+
+                    // --- Section: General Toggles ---
+                    texts.push((
+                        "常规与截图体验".into(),
+                        RectI::new(content_x + s(2), s(252), content_r, s(272)),
+                        (148, 163, 184),
+                        FontSlot::Section,
+                        DT_LEFT.0,
+                    ));
+                    let gen_card = RectI::new(content_x, s(274), content_r, s(424));
+                    draw_card(&mut pm, gen_card, 11.0 * sf, sf, Color::from_rgba8(22, 32, 50, 255));
+
+                    let toggles = [
+                        (HitKind::ToggleAutoStart, "开机自动启动", "后台静默常驻托盘，零显存占用", cfg.auto_start),
+                        (HitKind::ToggleSmartWin, "智能窗口边界识别", "截图悬停自动高亮目标窗口，单击即选", cfg.smart_window_detect),
+                        (HitKind::ToggleMagnifier, "像素放大镜与取色器", "悬停显示放大像素格，按 C 直接复制 #HEX", cfg.show_magnifier),
+                    ];
+                    for (i, (kind, title, desc, on)) in toggles.into_iter().enumerate() {
+                        let ry = gen_card.top + (i as i32) * s(50);
+                        if i > 0 {
+                            draw_divider(&mut pm, gen_card.left + s(16), ry, gen_card.right - s(16), sf);
+                        }
+                        let row_rect = RectI::new(gen_card.left, ry, gen_card.right, ry + s(50));
+                        hits.push(HitZone { rect: row_rect, kind });
+                        if hovered == Some(kind) {
+                            fill_rrect(
+                                &mut pm,
+                                (row_rect.left + s(4)) as f32,
+                                (row_rect.top + s(4)) as f32,
+                                (row_rect.width() - s(8)) as f32,
+                                (row_rect.height() - s(8)) as f32,
+                                8.0 * sf,
+                                Color::from_rgba8(255, 255, 255, 9),
+                            );
+                        }
+                        texts.push((
+                            title.into(),
+                            RectI::new(gen_card.left + s(16), ry + s(7), gen_card.right - s(80), ry + s(27)),
+                            (241, 245, 249),
+                            FontSlot::BodyBold,
+                            DT_LEFT.0,
+                        ));
+                        texts.push((
+                            desc.into(),
+                            RectI::new(gen_card.left + s(16), ry + s(26), gen_card.right - s(80), ry + s(44)),
+                            (148, 163, 184),
+                            FontSlot::Small,
+                            DT_LEFT.0,
+                        ));
+                        draw_toggle_switch(
+                            &mut pm,
+                            (gen_card.right - s(58)) as f32,
+                            (ry + s(14)) as f32,
+                            sf,
+                            on,
+                        );
+                    }
+
+                    // --- Compact Tips Card ---
+                    let tip_card = RectI::new(content_x, s(438), content_r, h - s(20));
+                    draw_card(&mut pm, tip_card, 11.0 * sf, sf, Color::from_rgba8(18, 27, 45, 255));
+                    texts.push((
+                        "快捷操作速查".into(),
+                        RectI::new(tip_card.left + s(16), tip_card.top + s(10), tip_card.right - s(16), tip_card.top + s(28)),
+                        (125, 211, 252),
+                        FontSlot::Small,
+                        DT_LEFT.0,
+                    ));
+                    texts.push((
+                        "截图时：双击选区 / Enter 复制 · F3 / T 贴图 · Ctrl+S 保存 · 右键重选 · 方向键 1px 微调".into(),
+                        RectI::new(tip_card.left + s(16), tip_card.top + s(32), tip_card.right - s(14), tip_card.top + s(54)),
+                        (148, 163, 184),
+                        FontSlot::Small,
+                        DT_LEFT.0 | DT_END_ELLIPSIS.0,
+                    ));
+                    texts.push((
+                        "贴图上：左键拖动 · 滚轮缩放 · Ctrl+滚轮透明度 · 双击/H 隐藏 · R 旋转 · Esc 关闭".into(),
+                        RectI::new(tip_card.left + s(16), tip_card.top + s(56), tip_card.right - s(14), tip_card.top + s(78)),
+                        (148, 163, 184),
+                        FontSlot::Small,
+                        DT_LEFT.0 | DT_END_ELLIPSIS.0,
+                    ));
+                    texts.push((
+                        "取色器：悬停像素放大镜按 C 复制 #HEX 色值 · 快捷键直接将剪贴板图片贴图".into(),
+                        RectI::new(tip_card.left + s(16), tip_card.top + s(80), tip_card.right - s(14), tip_card.top + s(102)),
+                        (148, 163, 184),
+                        FontSlot::Small,
+                        DT_LEFT.0 | DT_END_ELLIPSIS.0,
+                    ));
+                }
+                1 => {
+                    // --- Section: Local Saving ---
+                    texts.push((
+                        "本地保存".into(),
+                        RectI::new(content_x + s(2), s(66), content_r, s(86)),
+                        (148, 163, 184),
+                        FontSlot::Section,
+                        DT_LEFT.0,
+                    ));
+                    let save_card = RectI::new(content_x, s(88), content_r, s(260));
+                    draw_card(&mut pm, save_card, 11.0 * sf, sf, Color::from_rgba8(22, 32, 50, 255));
+
+                    texts.push((
+                        "默认保存目录".into(),
+                        RectI::new(save_card.left + s(16), s(96), save_card.right - s(16), s(116)),
+                        (203, 213, 225),
+                        FontSlot::Small,
+                        DT_LEFT.0,
+                    ));
+                    let dir_box = self.save_dir_box();
+                    draw_input_frame(&mut pm, dir_box, sf, focused_edit == Some(ID_EDIT_SAVE_DIR));
+                    let browse_rect = RectI::new(dir_box.right + s(8), dir_box.top, save_card.right - s(16), dir_box.bottom);
+                    hits.push(HitZone { rect: browse_rect, kind: HitKind::BrowseSaveDir });
+                    draw_ghost_button(&mut pm, browse_rect, sf, hovered == Some(HitKind::BrowseSaveDir), false);
+                    texts.push(("浏览…".into(), browse_rect, (226, 232, 240), FontSlot::Body, DT_CENTER.0));
+
+                    draw_divider(&mut pm, save_card.left + s(16), s(162), save_card.right - s(16), sf);
+                    texts.push((
+                        "默认保存格式".into(),
+                        RectI::new(save_card.left + s(16), s(166), save_card.left + s(150), s(208)),
+                        (241, 245, 249),
+                        FontSlot::BodyBold,
+                        DT_LEFT.0,
+                    ));
+                    let fmt_rect = RectI::new(save_card.right - s(246), s(172), save_card.right - s(16), s(202));
+                    draw_segmented_bar(
+                        &mut pm,
+                        &mut hits,
+                        &mut texts,
+                        fmt_rect,
+                        sf,
+                        &["PNG 无损", "JPEG", "BMP"],
+                        cfg.save_format.index(),
+                        hovered,
+                        HitKind::FormatSeg,
+                    );
+
+                    draw_divider(&mut pm, save_card.left + s(16), s(212), save_card.right - s(16), sf);
+                    let qs_row = RectI::new(save_card.left, s(212), save_card.right, s(260));
+                    hits.push(HitZone { rect: qs_row, kind: HitKind::ToggleQuickSave });
+                    if hovered == Some(HitKind::ToggleQuickSave) {
+                        fill_rrect(&mut pm, (qs_row.left + s(4)) as f32, (qs_row.top + s(4)) as f32, (qs_row.width() - s(8)) as f32, (qs_row.height() - s(8)) as f32, 8.0 * sf, Color::from_rgba8(255, 255, 255, 9));
+                    }
+                    texts.push((
+                        "保存时直接存入默认目录".into(),
+                        RectI::new(save_card.left + s(16), s(218), save_card.right - s(80), s(238)),
+                        (241, 245, 249),
+                        FontSlot::BodyBold,
+                        DT_LEFT.0,
+                    ));
+                    texts.push((
+                        "跳过系统「另存为」弹窗，按时间戳极速保存".into(),
+                        RectI::new(save_card.left + s(16), s(237), save_card.right - s(80), s(254)),
+                        (148, 163, 184),
+                        FontSlot::Small,
+                        DT_LEFT.0,
+                    ));
+                    draw_toggle_switch(&mut pm, (save_card.right - s(58)) as f32, s(225) as f32, sf, cfg.quick_save_no_dialog);
+
+                    // --- Section: Pin Behavior ---
+                    texts.push((
+                        "贴图窗口行为".into(),
+                        RectI::new(content_x + s(2), s(276), content_r, s(296)),
+                        (148, 163, 184),
+                        FontSlot::Section,
+                        DT_LEFT.0,
+                    ));
+                    let pin_card = RectI::new(content_x, s(298), content_r, s(404));
+                    draw_card(&mut pm, pin_card, 11.0 * sf, sf, Color::from_rgba8(22, 32, 50, 255));
+
+                    texts.push((
+                        "双击贴图动作".into(),
+                        RectI::new(pin_card.left + s(16), s(304), pin_card.left + s(150), s(348)),
+                        (241, 245, 249),
+                        FontSlot::BodyBold,
+                        DT_LEFT.0,
+                    ));
+                    let dbl_rect = RectI::new(pin_card.right - s(276), s(311), pin_card.right - s(16), s(341));
+                    draw_segmented_bar(
+                        &mut pm,
+                        &mut hits,
+                        &mut texts,
+                        dbl_rect,
+                        sf,
+                        &["隐藏省内存", "重置 100%", "直接关闭"],
+                        cfg.pin_double_click.index(),
+                        hovered,
+                        HitKind::PinDblClkSeg,
+                    );
+
+                    draw_divider(&mut pm, pin_card.left + s(16), s(352), pin_card.right - s(16), sf);
+                    let bd_row = RectI::new(pin_card.left, s(352), pin_card.right, s(404));
+                    hits.push(HitZone { rect: bd_row, kind: HitKind::TogglePinBorder });
+                    if hovered == Some(HitKind::TogglePinBorder) {
+                        fill_rrect(&mut pm, (bd_row.left + s(4)) as f32, (bd_row.top + s(4)) as f32, (bd_row.width() - s(8)) as f32, (bd_row.height() - s(8)) as f32, 8.0 * sf, Color::from_rgba8(255, 255, 255, 9));
+                    }
+                    texts.push((
+                        "贴图细边框保护".into(),
+                        RectI::new(pin_card.left + s(16), s(359), pin_card.right - s(80), s(379)),
+                        (241, 245, 249),
+                        FontSlot::BodyBold,
+                        DT_LEFT.0,
+                    ));
+                    texts.push((
+                        "绘制极细外轮廓，防止白底截图融入浅色窗口".into(),
+                        RectI::new(pin_card.left + s(16), s(378), pin_card.right - s(80), s(396)),
+                        (148, 163, 184),
+                        FontSlot::Small,
+                        DT_LEFT.0,
+                    ));
+                    draw_toggle_switch(&mut pm, (pin_card.right - s(58)) as f32, s(367) as f32, sf, cfg.pin_show_border);
+
+                    // --- Section: Pin Quick Management ---
+                    texts.push((
+                        "当前贴图快捷管理".into(),
+                        RectI::new(content_x + s(2), s(420), content_r, s(440)),
+                        (148, 163, 184),
+                        FontSlot::Section,
+                        DT_LEFT.0,
+                    ));
+                    let mg_card = RectI::new(content_x, s(442), content_r, s(506));
+                    draw_card(&mut pm, mg_card, 11.0 * sf, sf, Color::from_rgba8(22, 32, 50, 255));
+                    let gap = s(10);
+                    let bw = (mg_card.width() - s(32) - gap * 2) / 3;
+                    let actions = [
+                        (HitKind::HideAllPins, "隐藏全部贴图", false),
+                        (HitKind::ShowAllPins, "恢复全部贴图", false),
+                        (HitKind::CloseAllPins, "关闭全部贴图", true),
+                    ];
+                    for (i, (kind, label, danger)) in actions.into_iter().enumerate() {
+                        let bx = mg_card.left + s(16) + (i as i32) * (bw + gap);
+                        let br = RectI::new(bx, mg_card.top + s(15), bx + bw, mg_card.bottom - s(15));
+                        hits.push(HitZone { rect: br, kind });
+                        draw_ghost_button(&mut pm, br, sf, hovered == Some(kind), danger);
+                        let col = if danger && hovered == Some(kind) {
+                            (251, 113, 133)
+                        } else if danger {
+                            (248, 165, 178)
+                        } else {
+                            (226, 232, 240)
+                        };
+                        texts.push((label.into(), br, col, FontSlot::BodyBold, DT_CENTER.0));
+                    }
+                }
+                _ => {
+                    // --- Page 2: Updates ---
+                    let snap = self.updater.snapshot();
+                    let hero = RectI::new(content_x, s(66), content_r, s(206));
+                    draw_card(&mut pm, hero, 11.0 * sf, sf, Color::from_rgba8(22, 32, 50, 255));
+
+                    // Top row: Version + mode badge + action buttons
+                    texts.push((
+                        format!("v{}", snap.current_version),
+                        RectI::new(hero.left + s(16), hero.top + s(14), hero.left + s(88), hero.top + s(40)),
+                        (248, 250, 252),
+                        FontSlot::H1,
+                        DT_LEFT.0,
+                    ));
+                    let (mode_txt, mode_bg, mode_fg) = if snap.managed {
+                        ("Velopack 增量更新", Color::from_rgba8(16, 185, 129, 30), (52, 211, 153))
+                    } else {
+                        ("独立运行模式", Color::from_rgba8(245, 158, 11, 28), (251, 191, 36))
+                    };
+                    let mb = RectI::new(hero.left + s(90), hero.top + s(17), hero.left + s(212), hero.top + s(39));
+                    fill_rrect(&mut pm, mb.left as f32, mb.top as f32, mb.width() as f32, mb.height() as f32, 11.0 * sf, mode_bg);
+                    texts.push((mode_txt.into(), mb, mode_fg, FontSlot::Small, DT_CENTER.0));
+
+                    // Action buttons on right of hero header
+                    let preview_rect = RectI::new(hero.right - s(86), hero.top + s(14), hero.right - s(14), hero.top + s(44));
+                    hits.push(HitZone { rect: preview_rect, kind: HitKind::UpdatePreviewSplash });
+                    draw_ghost_button(&mut pm, preview_rect, sf, hovered == Some(HitKind::UpdatePreviewSplash), false);
+                    texts.push(("预览过渡".into(), preview_rect, (148, 163, 184), FontSlot::Small, DT_CENTER.0));
+
+                    let sec_kind = if snap.busy && snap.cancellable {
+                        HitKind::UpdateCancel
+                    } else {
+                        HitKind::UpdateRecheck
+                    };
+                    let sec_rect = RectI::new(preview_rect.left - s(78), hero.top + s(14), preview_rect.left - s(8), hero.top + s(44));
+                    if !snap.busy || snap.cancellable {
+                        hits.push(HitZone { rect: sec_rect, kind: sec_kind });
+                    }
+                    draw_ghost_button(&mut pm, sec_rect, sf, hovered == Some(sec_kind), sec_kind == HitKind::UpdateCancel);
+                    let sec_label = if sec_kind == HitKind::UpdateCancel { "取消" } else { "重检" };
+                    texts.push((sec_label.into(), sec_rect, (226, 232, 240), FontSlot::Body, DT_CENTER.0));
+
+                    let pri_rect = RectI::new(hero.left + s(16), hero.top + s(56), hero.left + s(190), hero.top + s(88));
+                    if !snap.busy {
+                        hits.push(HitZone { rect: pri_rect, kind: HitKind::UpdatePrimary });
+                    }
+                    draw_primary_button(&mut pm, pri_rect, sf, hovered == Some(HitKind::UpdatePrimary), snap.busy);
+                    texts.push((snap.primary_button_label(), pri_rect, (255, 255, 255), FontSlot::BodyBold, DT_CENTER.0));
+
+                    // Status text next to primary button
+                    texts.push((
+                        snap.status.clone(),
+                        RectI::new(pri_rect.right + s(14), hero.top + s(56), hero.right - s(16), hero.top + s(88)),
+                        match snap.phase {
+                            UpdatePhase::Error => (251, 113, 133),
+                            UpdatePhase::Downloaded | UpdatePhase::Current => (52, 211, 153),
+                            UpdatePhase::Available | UpdatePhase::Downloading | UpdatePhase::Verifying => (125, 211, 252),
+                            _ => (148, 163, 184),
+                        },
+                        FontSlot::Small,
+                        DT_LEFT.0 | DT_END_ELLIPSIS.0,
+                    ));
+
+                    // Sleek luminous gradient progress bar
+                    let bar_l = (hero.left + s(16)) as f32;
+                    let bar_t = (hero.top + s(106)) as f32;
+                    let bar_w = (hero.width() - s(32)) as f32;
+                    let bar_h = 8.0 * sf;
+                    fill_rrect(&mut pm, bar_l, bar_t, bar_w, bar_h, bar_h * 0.5, Color::from_rgba8(15, 23, 42, 255));
+                    let ratio = if snap.pending_restart {
+                        1.0
+                    } else if snap.busy && snap.progress == 0 {
+                        0.16
+                    } else {
+                        (snap.progress.clamp(0, 100) as f32) / 100.0
+                    };
+                    if ratio > 0.0 {
+                        let fw = (bar_w * ratio).max(bar_h * 1.5);
+                        if let Some(p) = rrect_path(bar_l, bar_t, fw, bar_h, bar_h * 0.5) {
+                            if let Some(g) = LinearGradient::new(
+                                Point::from_xy(bar_l, bar_t),
+                                Point::from_xy(bar_l + fw, bar_t),
+                                vec![
+                                    GradientStop::new(0.0, Color::from_rgba8(14, 165, 233, 255)),
+                                    GradientStop::new(1.0, Color::from_rgba8(52, 211, 153, 255)),
+                                ],
+                                SpreadMode::Pad,
+                                Transform::identity(),
+                            ) {
+                                let mut paint = Paint::default();
+                                paint.shader = g;
+                                paint.anti_alias = true;
+                                pm.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
+                            }
+                        }
+                    }
+                    let hint_line = if !snap.provider.is_empty() {
+                        format!("当前源：{} · 升级重启时自动启用独立过渡界面", snap.provider)
+                    } else {
+                        "升级安装时自动启用独立过渡界面，不中断配置保留".into()
+                    };
+                    texts.push((
+                        hint_line,
+                        RectI::new(hero.left + s(16), hero.top + s(118), hero.right - s(16), hero.bottom - s(4)),
+                        (100, 116, 139),
+                        FontSlot::Small,
+                        DT_LEFT.0 | DT_END_ELLIPSIS.0,
+                    ));
+
+                    // --- Mirror & Proxy Config Card ---
+                    let src_card = RectI::new(content_x, s(218), content_r, s(398));
+                    draw_card(&mut pm, src_card, 11.0 * sf, sf, Color::from_rgba8(22, 32, 50, 255));
+
+                    // Row 1: Preferred source segmented bar + auto-check toggle
+                    texts.push((
+                        "首选源".into(),
+                        RectI::new(src_card.left + s(16), s(228), src_card.left + s(90), s(258)),
+                        (203, 213, 225),
+                        FontSlot::BodyBold,
+                        DT_LEFT.0,
+                    ));
+                    let src_seg = RectI::new(src_card.left + s(96), s(229), src_card.left + s(276), s(257));
+                    draw_segmented_bar(
+                        &mut pm,
+                        &mut hits,
+                        &mut texts,
+                        src_seg,
+                        sf,
+                        &["CNB 优先", "GitHub 优先"],
+                        cfg.update.preferred_source.index(),
+                        hovered,
+                        HitKind::UpdateSourceSeg,
+                    );
+
+                    let auto_rect = RectI::new(src_card.right - s(172), s(228), src_card.right - s(14), s(258));
+                    hits.push(HitZone { rect: auto_rect, kind: HitKind::ToggleAutoCheck });
+                    texts.push((
+                        "启动自动检查".into(),
+                        RectI::new(auto_rect.left, auto_rect.top, auto_rect.right - s(48), auto_rect.bottom),
+                        (148, 163, 184),
+                        FontSlot::Small,
+                        DT_RIGHT.0,
+                    ));
+                    draw_toggle_switch(&mut pm, (auto_rect.right - s(42)) as f32, (auto_rect.top + s(4)) as f32, sf, cfg.update.auto_check_on_start);
+
+                    // Row 2: CNB URL
+                    texts.push((
+                        "CNB 地址".into(),
+                        RectI::new(src_card.left + s(16), s(272), src_card.left + s(92), s(302)),
+                        (203, 213, 225),
+                        FontSlot::Body,
+                        DT_LEFT.0,
+                    ));
+                    draw_input_frame(&mut pm, self.cnb_url_box(), sf, focused_edit == Some(ID_EDIT_CNB_URL));
+
+                    // Row 3: GitHub URL
+                    texts.push((
+                        "GitHub".into(),
+                        RectI::new(src_card.left + s(16), s(312), src_card.left + s(92), s(342)),
+                        (203, 213, 225),
+                        FontSlot::Body,
+                        DT_LEFT.0,
+                    ));
+                    draw_input_frame(&mut pm, self.github_url_box(), sf, focused_edit == Some(ID_EDIT_GITHUB_URL));
+
+                    // Row 4: Proxy
+                    let p_tog = RectI::new(src_card.left + s(16), s(354), src_card.left + s(126), s(384));
+                    hits.push(HitZone { rect: p_tog, kind: HitKind::ToggleProxy });
+                    texts.push((
+                        "代理".into(),
+                        RectI::new(p_tog.left, p_tog.top, p_tog.left + s(46), p_tog.bottom),
+                        (203, 213, 225),
+                        FontSlot::Body,
+                        DT_LEFT.0,
+                    ));
+                    draw_toggle_switch(&mut pm, (p_tog.left + s(50)) as f32, (p_tog.top + s(4)) as f32, sf, cfg.update.proxy.enabled);
+
+                    let proto_seg = RectI::new(src_card.left + s(134), s(355), src_card.left + s(238), s(383));
+                    draw_segmented_bar(
+                        &mut pm,
+                        &mut hits,
+                        &mut texts,
+                        proto_seg,
+                        sf,
+                        &["HTTP", "HTTPS"],
+                        if cfg.update.proxy.protocol == "https" { 1 } else { 0 },
+                        hovered,
+                        HitKind::ProxyProtoSeg,
+                    );
+                    draw_input_frame(&mut pm, self.proxy_host_box(), sf, focused_edit == Some(ID_EDIT_PROXY_HOST));
+                    draw_input_frame(&mut pm, self.proxy_port_box(), sf, focused_edit == Some(ID_EDIT_PROXY_PORT));
+
+                    // --- Release Notes Card ---
+                    texts.push((
+                        "版本更新日志".into(),
+                        RectI::new(content_x + s(2), s(410), content_r, s(428)),
+                        (148, 163, 184),
+                        FontSlot::Section,
+                        DT_LEFT.0,
+                    ));
+                    let notes_card = RectI::new(content_x, s(432), content_r, h - s(20));
+                    draw_card(&mut pm, notes_card, 11.0 * sf, sf, Color::from_rgba8(14, 22, 39, 255));
+                }
+            }
+
+            // Copy premultiplied RGBA Pixmap -> top-down BGRA DibSurface
+            let src = pm.data();
+            let dst = surface.pixels_mut();
+            for (spx, dpx) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+                dpx[0] = spx[2];
+                dpx[1] = spx[1];
+                dpx[2] = spx[0];
+                dpx[3] = 255;
+            }
+        }
+
+        // Draw all GDI ClearType text cleanly on top
+        for (txt, rect, col, slot, align) in texts {
+            let font = match slot {
+                FontSlot::Brand => self.font_brand.0,
+                FontSlot::H1 => self.font_h1.0,
+                FontSlot::Section => self.font_sec.0,
+                FontSlot::Body => self.font_body.0,
+                FontSlot::BodyBold => self.font_body_bold.0,
+                FontSlot::Small => self.font_small.0,
+            };
+            let wide = to_wide(&txt);
+            let mut r = RECT {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            };
+            unsafe {
+                let old = SelectObject(surface.dc, windows::Win32::Graphics::Gdi::HGDIOBJ(font.0));
+                SetBkMode(surface.dc, TRANSPARENT);
+                SetTextColor(surface.dc, rgb_colorref(col.0, col.1, col.2));
+                let _ = DrawTextW(
+                    surface.dc,
+                    &mut wide[..wide.len() - 1].to_vec(),
+                    &mut r,
+                    windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT(
+                        align | DT_VCENTER.0 | DT_SINGLELINE.0 | DT_NOCLIP.0,
+                    ),
+                );
+                let _ = SelectObject(surface.dc, old);
+            }
+        }
+
+        // Custom wrapped ClearType release notes on Tab 2 (zero ugly Win32 scrollbars!)
+        if self.active_tab.get() == 2 {
+            let s = |v: i32| self.s(v);
+            let nb = self.notes_box();
+            let text_pad_x = s(4);
+            let text_pad_y = s(4);
+            let viewport_h = (nb.height() - text_pad_y * 2).max(1);
+            let notes_text = self.current_release_notes_text();
+            let wide = to_wide(&notes_text);
+            let mut chars = wide[..wide.len().saturating_sub(1)].to_vec();
+            let mut measure = RECT {
+                left: nb.left + text_pad_x,
+                top: 0,
+                right: nb.right - text_pad_x - s(8),
+                bottom: 0,
+            };
+            unsafe {
+                let old = SelectObject(
+                    surface.dc,
+                    windows::Win32::Graphics::Gdi::HGDIOBJ(self.font_small.0.0),
+                );
+                SetBkMode(surface.dc, TRANSPARENT);
+                SetTextColor(surface.dc, rgb_colorref(203, 213, 225));
+                let _ = DrawTextW(
+                    surface.dc,
+                    &mut chars,
+                    &mut measure,
+                    windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT(
+                        DT_LEFT.0 | DT_WORDBREAK.0 | DT_CALCRECT.0,
+                    ),
+                );
+                let content_h = (measure.bottom - measure.top).max(0);
+                let max_scroll = (content_h - viewport_h).max(0);
+                self.notes_max_scroll.set(max_scroll);
+                let scroll = self.notes_scroll.get().clamp(0, max_scroll);
+                self.notes_scroll.set(scroll);
+
+                let saved = SaveDC(surface.dc);
+                let _ = IntersectClipRect(
+                    surface.dc,
+                    nb.left + text_pad_x,
+                    nb.top + text_pad_y,
+                    nb.right - text_pad_x,
+                    nb.bottom - text_pad_y,
+                );
+                let mut draw_r = RECT {
+                    left: nb.left + text_pad_x,
+                    top: nb.top + text_pad_y - scroll,
+                    right: nb.right - text_pad_x - s(8),
+                    bottom: nb.top + text_pad_y - scroll + content_h + s(20),
+                };
+                let _ = DrawTextW(
+                    surface.dc,
+                    &mut chars,
+                    &mut draw_r,
+                    windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT(DT_LEFT.0 | DT_WORDBREAK.0),
+                );
+                let _ = RestoreDC(surface.dc, saved);
+                let _ = SelectObject(surface.dc, old);
+            }
+        }
+
+        *self.hits.borrow_mut() = hits;
+    }
+
+    fn hit_at(&self, x: i32, y: i32) -> Option<HitKind> {
+        self.hits
+            .borrow()
+            .iter()
+            .rev()
+            .find(|z| z.rect.contains(x, y))
+            .map(|z| z.kind)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FontSlot {
+    Brand,
+    H1,
+    Section,
+    Body,
+    BodyBold,
+    Small,
+}
+
+fn rrect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
+    let r = r.min(w * 0.5).min(h * 0.5).max(0.0);
+    let k = 0.5522848 * r;
+    let mut pb = PathBuilder::new();
+    pb.move_to(x + r, y);
+    pb.line_to(x + w - r, y);
+    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
+    pb.line_to(x + w, y + h - r);
+    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
+    pb.line_to(x + r, y + h);
+    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
+    pb.line_to(x, y + r);
+    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
+    pb.close();
+    pb.finish()
+}
+
+fn fill_rect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, color: Color) {
+    if let Some(r) = tiny_skia::Rect::from_xywh(x, y, w, h) {
+        let mut p = Paint::default();
+        p.set_color(color);
+        pm.fill_rect(r, &p, Transform::identity(), None);
+    }
+}
+
+fn fill_rrect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, r: f32, color: Color) {
+    if let Some(path) = rrect_path(x, y, w, h, r) {
+        let mut p = Paint::default();
+        p.set_color(color);
+        p.anti_alias = true;
+        pm.fill_path(&path, &p, FillRule::Winding, Transform::identity(), None);
+    }
+}
+
+fn stroke_rrect(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, r: f32, width: f32, color: Color) {
+    if let Some(path) = rrect_path(x, y, w, h, r) {
+        let mut p = Paint::default();
+        p.set_color(color);
+        p.anti_alias = true;
+        let st = Stroke {
+            width,
+            ..Stroke::default()
+        };
+        pm.stroke_path(&path, &p, &st, Transform::identity(), None);
+    }
+}
+
+fn draw_card(pm: &mut Pixmap, rect: RectI, radius: f32, sf: f32, bg: Color) {
+    fill_rrect(
+        pm,
+        rect.left as f32,
+        rect.top as f32,
+        rect.width() as f32,
+        rect.height() as f32,
+        radius,
+        bg,
+    );
+    stroke_rrect(
+        pm,
+        rect.left as f32 + 0.5 * sf,
+        rect.top as f32 + 0.5 * sf,
+        rect.width() as f32 - sf,
+        rect.height() as f32 - sf,
+        (radius - 0.5 * sf).max(0.0),
+        1.0 * sf,
+        Color::from_rgba8(255, 255, 255, 18),
+    );
+}
+
+fn draw_divider(pm: &mut Pixmap, x0: i32, y: i32, x1: i32, sf: f32) {
+    fill_rect(
+        pm,
+        x0 as f32,
+        y as f32,
+        (x1 - x0).max(0) as f32,
+        (1.0 * sf).max(1.0),
+        Color::from_rgba8(255, 255, 255, 14),
+    );
+}
+
+fn draw_input_frame(pm: &mut Pixmap, rect: RectI, sf: f32, focused: bool) {
+    fill_rrect(
+        pm,
+        rect.left as f32,
+        rect.top as f32,
+        rect.width() as f32,
+        rect.height() as f32,
+        7.0 * sf,
+        Color::from_rgba8(14, 22, 39, 255),
+    );
+    let border = if focused {
+        Color::from_rgba8(56, 189, 248, 255)
+    } else {
+        Color::from_rgba8(42, 56, 82, 255)
+    };
+    stroke_rrect(
+        pm,
+        rect.left as f32 + 0.5 * sf,
+        rect.top as f32 + 0.5 * sf,
+        rect.width() as f32 - sf,
+        rect.height() as f32 - sf,
+        6.5 * sf,
+        if focused { 1.4 * sf } else { 1.0 * sf },
+        border,
+    );
+}
+
+fn draw_toggle_switch(pm: &mut Pixmap, x: f32, y: f32, sf: f32, on: bool) {
+    let w = 40.0 * sf;
+    let h = 22.0 * sf;
+    let r = h * 0.5;
+    let track_col = if on {
+        Color::from_rgba8(14, 165, 233, 255)
+    } else {
+        Color::from_rgba8(51, 65, 85, 255)
+    };
+    fill_rrect(pm, x, y, w, h, r, track_col);
+    if !on {
+        stroke_rrect(
+            pm,
+            x + 0.5 * sf,
+            y + 0.5 * sf,
+            w - sf,
+            h - sf,
+            r - 0.5 * sf,
+            1.0 * sf,
+            Color::from_rgba8(255, 255, 255, 22),
+        );
+    }
+    let knob_r = 7.5 * sf;
+    let cx = if on { x + w - 11.0 * sf } else { x + 11.0 * sf };
+    let cy = y + h * 0.5;
+    if let Some(sh) = PathBuilder::from_circle(cx, cy + 1.0 * sf, knob_r) {
+        let mut p = Paint::default();
+        p.set_color(Color::from_rgba8(0, 0, 0, 50));
+        p.anti_alias = true;
+        pm.fill_path(&sh, &p, FillRule::Winding, Transform::identity(), None);
+    }
+    if let Some(knob) = PathBuilder::from_circle(cx, cy, knob_r) {
+        let mut p = Paint::default();
+        p.set_color(Color::from_rgba8(248, 250, 252, 255));
+        p.anti_alias = true;
+        pm.fill_path(&knob, &p, FillRule::Winding, Transform::identity(), None);
+    }
+}
+
+fn draw_segmented_bar<F>(
+    pm: &mut Pixmap,
+    hits: &mut Vec<HitZone>,
+    texts: &mut Vec<(String, RectI, (u8, u8, u8), FontSlot, u32)>,
+    rect: RectI,
+    sf: f32,
+    labels: &[&str],
+    selected: usize,
+    hovered: Option<HitKind>,
+    make_kind: F,
+) where
+    F: Fn(usize) -> HitKind,
+{
+    fill_rrect(
+        pm,
+        rect.left as f32,
+        rect.top as f32,
+        rect.width() as f32,
+        rect.height() as f32,
+        8.0 * sf,
+        Color::from_rgba8(14, 22, 39, 255),
+    );
+    stroke_rrect(
+        pm,
+        rect.left as f32 + 0.5 * sf,
+        rect.top as f32 + 0.5 * sf,
+        rect.width() as f32 - sf,
+        rect.height() as f32 - sf,
+        7.5 * sf,
+        1.0 * sf,
+        Color::from_rgba8(42, 56, 82, 255),
+    );
+
+    let n = labels.len().max(1) as i32;
+    let pad = (3.0 * sf).round() as i32;
+    let inner_w = rect.width() - pad * 2;
+    let seg_w = inner_w / n;
+    for (i, &label) in labels.iter().enumerate() {
+        let kind = make_kind(i);
+        let sx = rect.left + pad + (i as i32) * seg_w;
+        let sr = RectI::new(
+            sx,
+            rect.top + pad,
+            if i + 1 == labels.len() {
+                rect.right - pad
+            } else {
+                sx + seg_w
+            },
+            rect.bottom - pad,
+        );
+        hits.push(HitZone { rect: sr, kind });
+        let active = i == selected;
+        let is_hov = hovered == Some(kind);
+        if active {
+            fill_rrect(
+                pm,
+                sr.left as f32,
+                sr.top as f32,
+                sr.width() as f32,
+                sr.height() as f32,
+                6.0 * sf,
+                Color::from_rgba8(14, 165, 233, 220),
+            );
+        } else if is_hov {
+            fill_rrect(
+                pm,
+                sr.left as f32,
+                sr.top as f32,
+                sr.width() as f32,
+                sr.height() as f32,
+                6.0 * sf,
+                Color::from_rgba8(255, 255, 255, 16),
+            );
+        }
+        texts.push((
+            label.into(),
+            sr,
+            if active {
+                (255, 255, 255)
+            } else if is_hov {
+                (226, 232, 240)
+            } else {
+                (148, 163, 184)
+            },
+            if active { FontSlot::Small } else { FontSlot::Small },
+            DT_CENTER.0,
+        ));
+    }
+}
+
+fn draw_primary_button(pm: &mut Pixmap, rect: RectI, sf: f32, hovered: bool, disabled: bool) {
+    let (c0, c1) = if disabled {
+        (
+            Color::from_rgba8(51, 65, 85, 255),
+            Color::from_rgba8(51, 65, 85, 255),
+        )
+    } else if hovered {
+        (
+            Color::from_rgba8(56, 189, 248, 255),
+            Color::from_rgba8(37, 99, 235, 255),
+        )
+    } else {
+        (
+            Color::from_rgba8(14, 165, 233, 255),
+            Color::from_rgba8(37, 99, 235, 255),
+        )
+    };
+    if let Some(path) = rrect_path(
+        rect.left as f32,
+        rect.top as f32,
+        rect.width() as f32,
+        rect.height() as f32,
+        8.0 * sf,
+    ) {
+        if let Some(grad) = LinearGradient::new(
+            Point::from_xy(rect.left as f32, rect.top as f32),
+            Point::from_xy(rect.right as f32, rect.bottom as f32),
+            vec![GradientStop::new(0.0, c0), GradientStop::new(1.0, c1)],
+            SpreadMode::Pad,
+            Transform::identity(),
+        ) {
+            let mut p = Paint::default();
+            p.shader = grad;
+            p.anti_alias = true;
+            pm.fill_path(&path, &p, FillRule::Winding, Transform::identity(), None);
+        }
+    }
+}
+
+fn draw_ghost_button(pm: &mut Pixmap, rect: RectI, sf: f32, hovered: bool, danger: bool) {
+    let bg = match (hovered, danger) {
+        (true, true) => Color::from_rgba8(244, 63, 94, 46),
+        (true, false) => Color::from_rgba8(42, 56, 82, 255),
+        (false, true) => Color::from_rgba8(244, 63, 94, 18),
+        (false, false) => Color::from_rgba8(28, 40, 62, 255),
+    };
+    let border = match (hovered, danger) {
+        (true, true) => Color::from_rgba8(244, 63, 94, 140),
+        (true, false) => Color::from_rgba8(100, 116, 139, 140),
+        (false, true) => Color::from_rgba8(244, 63, 94, 60),
+        (false, false) => Color::from_rgba8(255, 255, 255, 24),
+    };
+    fill_rrect(
+        pm,
+        rect.left as f32,
+        rect.top as f32,
+        rect.width() as f32,
+        rect.height() as f32,
+        7.0 * sf,
+        bg,
+    );
+    stroke_rrect(
+        pm,
+        rect.left as f32 + 0.5 * sf,
+        rect.top as f32 + 0.5 * sf,
+        rect.width() as f32 - sf,
+        rect.height() as f32 - sf,
+        6.5 * sf,
+        1.0 * sf,
+        border,
+    );
+}
+
+fn draw_nav_icon(pm: &mut Pixmap, idx: usize, x: f32, y: f32, sf: f32, color: Color) {
+    let mut paint = Paint::default();
+    paint.set_color(color);
+    paint.anti_alias = true;
+    let st = Stroke {
+        width: 1.6,
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..Stroke::default()
+    };
+    let mut pb = PathBuilder::new();
+    match idx {
+        0 => {
+            // Keyboard icon (16x16)
+            pb.move_to(2.0, 4.0);
+            pb.line_to(14.0, 4.0);
+            pb.line_to(14.0, 12.5);
+            pb.line_to(2.0, 12.5);
+            pb.close();
+            pb.move_to(4.5, 7.0);
+            pb.line_to(5.5, 7.0);
+            pb.move_to(7.5, 7.0);
+            pb.line_to(8.5, 7.0);
+            pb.move_to(10.5, 7.0);
+            pb.line_to(11.5, 7.0);
+            pb.move_to(5.0, 10.0);
+            pb.line_to(11.0, 10.0);
+        }
+        1 => {
+            // Pin / Frame icon (16x16)
+            pb.move_to(5.0, 2.5);
+            pb.line_to(11.0, 2.5);
+            pb.line_to(10.0, 7.2);
+            pb.line_to(12.5, 9.5);
+            pb.line_to(3.5, 9.5);
+            pb.line_to(6.0, 7.2);
+            pb.close();
+            pb.move_to(8.0, 9.5);
+            pb.line_to(8.0, 14.0);
+        }
+        _ => {
+            // Update / Refresh arrows icon (16x16)
+            pb.move_to(13.0, 7.5);
+            pb.cubic_to(13.0, 4.5, 10.8, 2.5, 8.0, 2.5);
+            pb.cubic_to(5.7, 2.5, 3.8, 3.9, 3.2, 5.8);
+            pb.move_to(3.0, 8.5);
+            pb.cubic_to(3.0, 11.5, 5.2, 13.5, 8.0, 13.5);
+            pb.cubic_to(10.3, 13.5, 12.2, 12.1, 12.8, 10.2);
+            pb.move_to(11.0, 6.2);
+            pb.line_to(13.2, 7.8);
+            pb.line_to(14.5, 5.4);
+            pb.move_to(5.0, 9.8);
+            pb.line_to(2.8, 8.2);
+            pb.line_to(1.5, 10.6);
+        }
+    }
+    if let Some(path) = pb.finish() {
+        let xf = Transform::from_translate(x, y).pre_scale(sf, sf);
+        pm.stroke_path(&path, &paint, &st, xf, None);
+    }
+}
+
+fn lparam_xy(lparam: LPARAM) -> (i32, i32) {
+    let x = (lparam.0 & 0xFFFF) as i16 as i32;
+    let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+    (x, y)
 }
 
 fn key_down(vk: u16) -> bool {
     unsafe { (GetAsyncKeyState(vk as i32) as u16 & 0x8000) != 0 }
-}
-
-unsafe extern "system" fn hotkey_edit_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_SETFOCUS => {
-            SETTINGS.with(|cell| {
-                if let Some(win) = cell.borrow().as_ref() {
-                    (win.callbacks.on_suspend_hotkeys)(true);
-                    set_text(win.controls.footer_lbl, "请直接按下要绑定的组合键（Backspace 清空，Esc 退出）");
-                }
-            });
-        }
-        WM_KILLFOCUS => {
-            SETTINGS.with(|cell| {
-                if let Some(win) = cell.borrow().as_ref() {
-                    (win.callbacks.on_suspend_hotkeys)(false);
-                }
-            });
-        }
-        WM_KEYDOWN | WM_SYSKEYDOWN => {
-            let vk = wparam.0 as u32;
-            if vk == VK_ESCAPE.0 as u32 {
-                let parent = SETTINGS.with(|cell| cell.borrow().as_ref().map(|w| w.hwnd));
-                if let Some(p) = parent {
-                    unsafe {
-                        let _ = SetFocus(Some(p));
-                    }
-                }
-                return LRESULT(0);
-            }
-            if vk == VK_BACK.0 as u32 || vk == VK_DELETE.0 as u32 {
-                set_text(hwnd, "无");
-                let parent = SETTINGS.with(|cell| {
-                    let borrow = cell.borrow();
-                    let win = borrow.as_ref()?;
-                    win.save_config(false);
-                    Some(win.hwnd)
-                });
-                if let Some(p) = parent {
-                    unsafe {
-                        let _ = SetFocus(Some(p));
-                    }
-                }
-                return LRESULT(0);
-            }
-            if HotkeySpec::is_modifier_only_vk(vk) {
-                return LRESULT(0);
-            }
-            if crate::hotkey::vk_to_key_name(vk).is_some() {
-                let mut mods = 0u32;
-                if key_down(VK_CONTROL.0) {
-                    mods |= MOD_FLAG_CTRL;
-                }
-                if key_down(VK_MENU.0) {
-                    mods |= MOD_FLAG_ALT;
-                }
-                if key_down(VK_SHIFT.0) {
-                    mods |= MOD_FLAG_SHIFT;
-                }
-                if key_down(VK_LWIN.0) || key_down(VK_RWIN.0) {
-                    mods |= MOD_FLAG_WIN;
-                }
-                let spec = HotkeySpec { modifiers: mods, vk };
-                set_text(hwnd, &spec.format());
-                let parent = SETTINGS.with(|cell| {
-                    let borrow = cell.borrow();
-                    let win = borrow.as_ref()?;
-                    win.save_config(false);
-                    Some(win.hwnd)
-                });
-                if let Some(p) = parent {
-                    unsafe {
-                        let _ = SetFocus(Some(p));
-                    }
-                }
-            }
-            return LRESULT(0);
-        }
-        _ => {}
-    }
-
-    let orig = SETTINGS.with(|cell| {
-        let borrow = cell.borrow();
-        let win = borrow.as_ref()?;
-        if hwnd == win.controls.hk_shot {
-            win.orig_hotkey_procs[0]
-        } else if hwnd == win.controls.hk_pin {
-            win.orig_hotkey_procs[1]
-        } else if hwnd == win.controls.hk_toggle {
-            win.orig_hotkey_procs[2]
-        } else {
-            None
-        }
-    });
-    if orig.is_some() {
-        unsafe { CallWindowProcW(orig, hwnd, msg, wparam, lparam) }
-    } else {
-        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-    }
 }
 
 unsafe extern "system" fn settings_wnd_proc(
@@ -1473,36 +2163,260 @@ unsafe extern "system" fn settings_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
-        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+        WM_ERASEBKGND => return LRESULT(1),
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
+            SETTINGS.with(|cell| {
+                if let Ok(borrow) = cell.try_borrow() {
+                    if let Some(win) = borrow.as_ref() {
+                        if let Some(mut surface) = DibSurface::new(win.client_w, win.client_h) {
+                            win.render_to_surface(&mut surface);
+                            unsafe {
+                                let _ = BitBlt(
+                                    hdc,
+                                    0,
+                                    0,
+                                    win.client_w,
+                                    win.client_h,
+                                    Some(surface.dc),
+                                    0,
+                                    0,
+                                    SRCCOPY,
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+            unsafe {
+                let _ = EndPaint(hwnd, &ps);
+            }
+            return LRESULT(0);
+        }
+        WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC => {
             let hdc = HDC(wparam.0 as *mut _);
             unsafe {
-                SetBkMode(hdc, TRANSPARENT);
-                SetBkColor(hdc, COLORREF(0x00FFFFFF));
-                SetTextColor(hdc, rgb_colorref(30, 41, 59));
+                SetTextColor(hdc, rgb_colorref(241, 245, 249));
+                SetBkColor(hdc, rgb_colorref(14, 22, 39));
             }
             let brush = SETTINGS.with(|cell| {
                 cell.try_borrow()
                     .ok()
-                    .and_then(|b| b.as_ref().map(|w| w.bg_brush.0.0 as isize))
+                    .and_then(|b| b.as_ref().map(|w| w.edit_bg_brush.0.0 as isize))
                     .unwrap_or(0)
             });
             if brush != 0 {
                 return LRESULT(brush);
             }
         }
-        WM_NOTIFY => {
-            let nmhdr = unsafe { &*(lparam.0 as *const NMHDR) };
-            if nmhdr.idFrom == ID_TAB && nmhdr.code == TCN_SELCHANGE {
+        WM_SETCURSOR => {
+            let over_interactive = SETTINGS.with(|cell| {
+                cell.try_borrow()
+                    .ok()
+                    .and_then(|b| b.as_ref().map(|w| w.hovered.get().is_some()))
+                    .unwrap_or(false)
+            });
+            if over_interactive {
+                unsafe {
+                    if let Ok(c) = LoadCursorW(None, IDC_HAND) {
+                        SetCursor(Some(c));
+                    }
+                }
+                return LRESULT(1);
+            }
+        }
+        WM_MOUSEMOVE => {
+            let (x, y) = lparam_xy(lparam);
+            let need_track = SETTINGS.with(|cell| {
+                let Ok(borrow) = cell.try_borrow() else {
+                    return false;
+                };
+                let Some(win) = borrow.as_ref() else {
+                    return false;
+                };
+                let hit = win.hit_at(x, y);
+                if hit != win.hovered.get() {
+                    win.hovered.set(hit);
+                    win.request_repaint();
+                }
+                if !win.tracking_leave.get() {
+                    win.tracking_leave.set(true);
+                    true
+                } else {
+                    false
+                }
+            });
+            if need_track {
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                unsafe {
+                    let _ = TrackMouseEvent(&mut tme);
+                }
+            }
+            return LRESULT(0);
+        }
+        WM_MOUSELEAVE => {
+            SETTINGS.with(|cell| {
+                if let Ok(borrow) = cell.try_borrow() {
+                    if let Some(win) = borrow.as_ref() {
+                        win.tracking_leave.set(false);
+                        if win.hovered.replace(None).is_some() {
+                            win.request_repaint();
+                        }
+                    }
+                }
+            });
+            return LRESULT(0);
+        }
+        WM_LBUTTONDOWN => {
+            let (x, y) = lparam_xy(lparam);
+            let hit = SETTINGS.with(|cell| {
+                let borrow = cell.borrow();
+                let win = borrow.as_ref()?;
+                win.hit_at(x, y)
+            });
+            if let Some(kind) = hit {
                 SETTINGS.with(|cell| {
                     if let Some(win) = cell.borrow().as_ref() {
+                        win.handle_click(kind);
+                    }
+                });
+            } else {
+                // Clicking empty area exits hotkey recording & removes focus from edits
+                SETTINGS.with(|cell| {
+                    if let Some(win) = cell.borrow().as_ref() {
+                        win.cancel_recording();
                         win.flush_pending_autosave();
-                        let sel = unsafe { SendMessageW(win.tab_ctrl, TCM_GETCURSEL, None, None).0 };
-                        if sel >= 0 {
-                            win.switch_tab(sel as usize);
-                            if sel == 1 {
-                                win.refresh_memory_stats();
-                            } else if sel == 2 {
-                                win.refresh_update_ui();
+                    }
+                });
+                let cur_focus = unsafe { GetFocus() };
+                if cur_focus != hwnd {
+                    unsafe {
+                        let _ = SetFocus(Some(hwnd));
+                    }
+                }
+            }
+            return LRESULT(0);
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            let vk = wparam.0 as u32;
+            let rec_slot = SETTINGS.with(|cell| {
+                cell.borrow()
+                    .as_ref()
+                    .and_then(|w| w.recording_slot.get())
+            });
+            if let Some(slot) = rec_slot {
+                if vk == VK_ESCAPE.0 as u32 {
+                    SETTINGS.with(|cell| {
+                        if let Some(win) = cell.borrow().as_ref() {
+                            win.cancel_recording();
+                            win.set_toast("已取消快捷键录制", ToastTone::Muted);
+                        }
+                    });
+                    return LRESULT(0);
+                }
+                if vk == VK_BACK.0 as u32 || vk == VK_DELETE.0 as u32 {
+                    SETTINGS.with(|cell| {
+                        if let Some(win) = cell.borrow().as_ref() {
+                            win.recording_slot.set(None);
+                            {
+                                let mut cfg = win.cfg.borrow_mut();
+                                match slot {
+                                    0 => cfg.screenshot_hotkey.clear(),
+                                    1 => cfg.pin_clipboard_hotkey.clear(),
+                                    _ => cfg.toggle_pins_hotkey.clear(),
+                                }
+                            }
+                            win.save_config(false);
+                        }
+                    });
+                    return LRESULT(0);
+                }
+                if HotkeySpec::is_modifier_only_vk(vk) {
+                    return LRESULT(0);
+                }
+                if crate::hotkey::vk_to_key_name(vk).is_some() {
+                    let mut mods = 0u32;
+                    if key_down(VK_CONTROL.0) {
+                        mods |= MOD_FLAG_CTRL;
+                    }
+                    if key_down(VK_MENU.0) {
+                        mods |= MOD_FLAG_ALT;
+                    }
+                    if key_down(VK_SHIFT.0) {
+                        mods |= MOD_FLAG_SHIFT;
+                    }
+                    if key_down(VK_LWIN.0) || key_down(VK_RWIN.0) {
+                        mods |= MOD_FLAG_WIN;
+                    }
+                    let formatted = HotkeySpec { modifiers: mods, vk }.format();
+                    SETTINGS.with(|cell| {
+                        if let Some(win) = cell.borrow().as_ref() {
+                            win.recording_slot.set(None);
+                            {
+                                let mut cfg = win.cfg.borrow_mut();
+                                match slot {
+                                    0 => cfg.screenshot_hotkey = formatted.clone(),
+                                    1 => cfg.pin_clipboard_hotkey = formatted.clone(),
+                                    _ => cfg.toggle_pins_hotkey = formatted.clone(),
+                                }
+                            }
+                            win.save_config(false);
+                        }
+                    });
+                }
+                return LRESULT(0);
+            }
+        }
+        WM_MOUSEWHEEL => {
+            let delta = ((wparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            SETTINGS.with(|cell| {
+                if let Ok(borrow) = cell.try_borrow() {
+                    if let Some(win) = borrow.as_ref() {
+                        if win.active_tab.get() == 2 && win.notes_max_scroll.get() > 0 {
+                            let step = win.s(26);
+                            let next = (win.notes_scroll.get() - (delta / 120) * step)
+                                .clamp(0, win.notes_max_scroll.get());
+                            if next != win.notes_scroll.get() {
+                                win.notes_scroll.set(next);
+                                win.request_repaint();
+                            }
+                        }
+                    }
+                }
+            });
+            return LRESULT(0);
+        }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as usize;
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            if matches!(
+                id,
+                ID_EDIT_SAVE_DIR
+                    | ID_EDIT_CNB_URL
+                    | ID_EDIT_GITHUB_URL
+                    | ID_EDIT_PROXY_HOST
+                    | ID_EDIT_PROXY_PORT
+            ) {
+                SETTINGS.with(|cell| {
+                    if let Ok(borrow) = cell.try_borrow() {
+                        if let Some(win) = borrow.as_ref() {
+                            if code == EN_SETFOCUS {
+                                win.focused_edit.set(Some(id));
+                                win.request_repaint();
+                            } else if code == EN_KILLFOCUS {
+                                if win.focused_edit.get() == Some(id) {
+                                    win.focused_edit.set(None);
+                                }
+                                win.flush_pending_autosave();
+                                win.request_repaint();
+                            } else if code == EN_CHANGE {
+                                win.schedule_autosave();
                             }
                         }
                     }
@@ -1510,207 +2424,32 @@ unsafe extern "system" fn settings_wnd_proc(
                 return LRESULT(0);
             }
         }
-        WM_COMMAND => {
-            let id = (wparam.0 & 0xFFFF) as usize;
-            let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
-            match id {
-                ID_BTN_CLOSE => {
-                    SETTINGS.with(|cell| {
-                        if let Some(win) = cell.borrow().as_ref() {
-                            win.flush_pending_autosave();
-                        }
-                    });
-                    unsafe {
-                        let _ = DestroyWindow(hwnd);
-                    }
-                    return LRESULT(0);
-                }
-                ID_BTN_CLR_SHOT => {
-                    SETTINGS.with(|cell| {
-                        if let Some(win) = cell.borrow().as_ref() {
-                            set_text(win.controls.hk_shot, "无");
-                            win.save_config(false);
-                        }
-                    });
-                    return LRESULT(0);
-                }
-                ID_BTN_CLR_PIN => {
-                    SETTINGS.with(|cell| {
-                        if let Some(win) = cell.borrow().as_ref() {
-                            set_text(win.controls.hk_pin, "无");
-                            win.save_config(false);
-                        }
-                    });
-                    return LRESULT(0);
-                }
-                ID_BTN_CLR_TOGGLE => {
-                    SETTINGS.with(|cell| {
-                        if let Some(win) = cell.borrow().as_ref() {
-                            set_text(win.controls.hk_toggle, "无");
-                            win.save_config(false);
-                        }
-                    });
-                    return LRESULT(0);
-                }
-                ID_CHK_AUTOSTART
-                | ID_CHK_SMART_WIN
-                | ID_CHK_MAGNIFIER
-                | ID_CHK_QUICK_SAVE
-                | ID_CHK_PIN_BORDER
-                | ID_CHK_PROXY
-                | ID_CHK_AUTO_UPDATE
-                    if code == BN_CLICKED =>
-                {
-                    SETTINGS.with(|cell| {
-                        if let Some(win) = cell.borrow().as_ref() {
-                            if win.ready.get() {
-                                win.save_config(false);
-                            }
-                        }
-                    });
-                    return LRESULT(0);
-                }
-                ID_CMB_FORMAT | ID_CMB_PIN_DBLCLK | ID_CMB_UPDATE_SRC | ID_CMB_PROXY_PROTO
-                    if code == CBN_SELCHANGE =>
-                {
-                    SETTINGS.with(|cell| {
-                        if let Some(win) = cell.borrow().as_ref() {
-                            if win.ready.get() {
-                                win.save_config(false);
-                            }
-                        }
-                    });
-                    return LRESULT(0);
-                }
-                ID_EDIT_SAVE_DIR
-                | ID_EDIT_CNB_URL
-                | ID_EDIT_GITHUB_URL
-                | ID_EDIT_PROXY_HOST
-                | ID_EDIT_PROXY_PORT => {
-                    if code == EN_CHANGE {
-                        SETTINGS.with(|cell| {
-                            if let Some(win) = cell.borrow().as_ref() {
-                                win.schedule_autosave();
-                            }
-                        });
-                    } else if code == EN_KILLFOCUS {
-                        SETTINGS.with(|cell| {
-                            if let Some(win) = cell.borrow().as_ref() {
-                                win.flush_pending_autosave();
-                            }
-                        });
-                    }
-                    return LRESULT(0);
-                }
-                ID_BTN_BROWSE_DIR => {
-                    if let Some(dir) = browse_folder_dialog(Some(hwnd)) {
-                        SETTINGS.with(|cell| {
-                            if let Some(win) = cell.borrow().as_ref() {
-                                set_text(win.controls.save_dir, &dir.to_string_lossy());
-                                win.save_config(false);
-                            }
-                        });
-                    }
-                    return LRESULT(0);
-                }
-                ID_BTN_HIDE_PINS => {
-                    pin::hide_all_pins();
-                    SETTINGS.with(|cell| {
-                        if let Some(win) = cell.borrow().as_ref() {
-                            win.refresh_memory_stats();
-                        }
-                    });
-                    return LRESULT(0);
-                }
-                ID_BTN_SHOW_PINS => {
-                    pin::show_all_pins();
-                    SETTINGS.with(|cell| {
-                        if let Some(win) = cell.borrow().as_ref() {
-                            win.refresh_memory_stats();
-                        }
-                    });
-                    return LRESULT(0);
-                }
-                ID_BTN_CLOSE_PINS => {
-                    pin::close_all_pins();
-                    SETTINGS.with(|cell| {
-                        if let Some(win) = cell.borrow().as_ref() {
-                            win.refresh_memory_stats();
-                        }
-                    });
-                    return LRESULT(0);
-                }
-                ID_BTN_UPDATE_PRIMARY => {
-                    let action = SETTINGS.with(|cell| {
-                        let borrow = cell.borrow();
-                        let win = borrow.as_ref()?;
-                        if !win.save_config(false) {
-                            return None;
-                        }
-                        Some((win.updater.clone(), win.callbacks.on_exit_for_update.clone()))
-                    });
-                    if let Some((updater, on_exit)) = action {
-                        updater.start_download_or_install_async(on_exit);
-                    }
-                    return LRESULT(0);
-                }
-                ID_BTN_UPDATE_CHECK => {
-                    let updater = SETTINGS.with(|cell| {
-                        let borrow = cell.borrow();
-                        let win = borrow.as_ref()?;
-                        if !win.save_config(false) {
-                            return None;
-                        }
-                        Some(win.updater.clone())
-                    });
-                    if let Some(updater) = updater {
-                        updater.start_check_async();
-                    }
-                    return LRESULT(0);
-                }
-                ID_BTN_UPDATE_CANCEL => {
-                    SETTINGS.with(|cell| {
-                        if let Some(win) = cell.borrow().as_ref() {
-                            win.updater.cancel();
-                        }
-                    });
-                    return LRESULT(0);
-                }
-                _ => {}
-            }
-        }
         WM_TIMER => {
             if wparam.0 == TIMER_STATS {
                 SETTINGS.with(|cell| {
-                    if let Some(win) = cell.borrow().as_ref() {
-                        win.refresh_memory_stats();
+                    if let Ok(borrow) = cell.try_borrow() {
+                        if let Some(win) = borrow.as_ref() {
+                            win.request_repaint();
+                        }
                     }
                 });
                 return LRESULT(0);
             }
             if wparam.0 == TIMER_AUTOSAVE {
                 SETTINGS.with(|cell| {
-                    if let Some(win) = cell.borrow().as_ref() {
-                        win.save_config(true);
+                    if let Ok(borrow) = cell.try_borrow() {
+                        if let Some(win) = borrow.as_ref() {
+                            win.save_config(true);
+                        }
                     }
                 });
                 return LRESULT(0);
             }
         }
-        WM_GETFONT => {
-            let f = SETTINGS.with(|cell| {
-                cell.borrow()
-                    .as_ref()
-                    .map(|w| w.font_ui.0.0 as isize)
-                    .unwrap_or(0)
-            });
-            if f != 0 {
-                return LRESULT(f);
-            }
-        }
         WM_CLOSE => {
             SETTINGS.with(|cell| {
                 if let Some(win) = cell.borrow().as_ref() {
+                    win.cancel_recording();
                     win.flush_pending_autosave();
                 }
             });
@@ -1726,7 +2465,7 @@ unsafe extern "system" fn settings_wnd_proc(
             }
             SETTINGS.with(|cell| {
                 if let Some(win) = cell.borrow().as_ref() {
-                    (win.callbacks.on_suspend_hotkeys)(false);
+                    win.cancel_recording();
                 }
             });
         }
@@ -1734,8 +2473,45 @@ unsafe extern "system" fn settings_wnd_proc(
             SETTINGS.with(|cell| {
                 *cell.borrow_mut() = None;
             });
+            crate::util::trim_working_set();
         }
         _ => {}
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+#[cfg(test)]
+mod visual_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    #[ignore]
+    fn render_settings_visual_snapshots() {
+        unsafe {
+            let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+                windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            );
+        }
+        let out_dir = std::env::var("RHPICTURE_SNAPSHOT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let cfg = AppConfig::default();
+        let updater = UpdateService::new(cfg.update.clone(), None);
+        open_settings(
+            &cfg,
+            updater,
+            Some(0),
+            SettingsCallbacks {
+                on_config_saved: Box::new(|_| Vec::new()),
+                on_suspend_hotkeys: Box::new(|_| {}),
+                on_exit_for_update: Arc::new(|| {}),
+            },
+        );
+        for tab in 0..3 {
+            let path = out_dir.join(format!("settings-tab{tab}.png"));
+            assert!(capture_settings_snapshot(tab, &path), "failed snapshot tab {tab}");
+        }
+        close_settings_if_open();
+    }
 }

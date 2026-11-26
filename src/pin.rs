@@ -7,7 +7,7 @@ use crate::util::{
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Once;
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Transform};
+use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, DIB_RGB_COLORS, DT_CENTER,
@@ -519,14 +519,14 @@ impl PinWindow {
                 self.font_hud = OwnedFont(create_ui_font(dpi, 10, true));
             }
 
-            // Draw crisp DPI-scaled border (accent blue when hovered, subtle neutral otherwise)
+            // Draw crisp dual-tone DPI-scaled border so pins stand out on both white & dark backdrops
             if show_border || self.hovered {
+                let bw = scale_dpi(1, dpi).clamp(1, 2) as usize;
                 let border = if self.hovered {
-                    [246u8, 130, 59, 255] // #3B82F6 in BGRA
+                    [248u8, 189, 56, 255] // #38BDF8 sky-cyan in BGRA
                 } else {
-                    [130u8, 116, 100, 255]
+                    [105u8, 85, 71, 255] // refined slate edge
                 };
-                let bw = scale_dpi(1, dpi).clamp(1, 3) as usize;
                 draw_border(surface.pixels_mut(), win_w as usize, win_h as usize, bw, border);
             }
 
@@ -583,7 +583,7 @@ fn draw_hud_pill(
     let py = ((surface.height - ph) / 2).max(0);
 
     if let Some(mut pm) = Pixmap::new(pw as u32, ph as u32) {
-        let r = (7.0 * sf).min(pw as f32 * 0.5).min(ph as f32 * 0.5);
+        let r = (10.0 * sf).min(pw as f32 * 0.5).min(ph as f32 * 0.5);
         let k = 0.5522848 * r;
         let (w, h) = (pw as f32, ph as f32);
         let mut pb = PathBuilder::new();
@@ -599,9 +599,18 @@ fn draw_hud_pill(
         pb.close();
         if let Some(path) = pb.finish() {
             let mut paint = Paint::default();
-            paint.set_color(Color::from_rgba8(15, 23, 42, 215));
+            paint.set_color(Color::from_rgba8(15, 23, 42, 232));
             paint.anti_alias = true;
             pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+
+            let mut rim = Paint::default();
+            rim.set_color(Color::from_rgba8(255, 255, 255, 42));
+            rim.anti_alias = true;
+            let st = Stroke {
+                width: (1.0 * sf).max(1.0),
+                ..Stroke::default()
+            };
+            pm.stroke_path(&path, &rim, &st, Transform::identity(), None);
         }
 
         let sw = surface.width;

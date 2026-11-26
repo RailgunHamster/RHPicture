@@ -10,5 +10,7 @@ pub mod pin;
 pub mod settings_ui;
 #[cfg(windows)]
 pub mod tray;
+#[cfg(windows)]
+pub mod update_splash;
 pub mod updater;
 pub mod util;
