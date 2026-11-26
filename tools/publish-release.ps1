@@ -7,7 +7,7 @@
     pwsh -File tools\publish-release.ps1 -Provider github -Repository RailgunHamster/RHPicture -Version 0.1.0 -NotesFile RELEASE-NOTES-v0.1.0.md
 
 .EXAMPLE
-    pwsh -File tools\publish-release.ps1 -Provider cnb -Repository railgunhamster/RHPicture -Version 0.1.0 -NotesFile RELEASE-NOTES-v0.1.0.md
+    pwsh -File tools\publish-release.ps1 -Provider cnb -Repository railgunhamster/RHPicture -Version 0.1.0 -NotesFile RELEASE-NOTES-v0.1.0.md -BundlePath rhpicture.bundle
 #>
 [CmdletBinding()]
 param(
@@ -16,6 +16,7 @@ param(
     [Parameter(Mandatory)][ValidatePattern('^\d+\.\d+\.\d+(?:-[A-Za-z0-9.]+)?$')][string]$Version,
     [string]$ReleaseDir = '',
     [string]$NotesFile = '',
+    [string]$BundlePath = '',
     [string]$CnbTokenFile = "$env:LOCALAPPDATA\RHFiles-Publishing\cnb-token.xml"
 )
 
@@ -121,6 +122,11 @@ if ($Provider -eq 'github') {
     try {
         $release = Invoke-GitHubApi 'GET' "/releases/tags/$tag" $null -Allow404
         if (-not $release) {
+            # Also check draft releases so we reuse an existing draft for this tag
+            $all = Invoke-GitHubApi 'GET' '/releases?per_page=30'
+            $release = @($all | Where-Object { $_.tag_name -ceq $tag }) | Select-Object -First 1
+        }
+        if (-not $release) {
             $release = Invoke-GitHubApi 'POST' '/releases' @{
                 tag_name         = $tag
                 target_commitish = 'main'
@@ -130,7 +136,10 @@ if ($Provider -eq 'github') {
                 prerelease       = $false
             }
         }
-        $uploadBase = $release.upload_url -replace '\{.*$', ''
+        $uploadBase = ([string]$release.upload_url) -replace '\{.*$', ''
+        if (-not $uploadBase.StartsWith('https://uploads.github.com/')) {
+            throw 'Unexpected GitHub upload_url'
+        }
         foreach ($filePath in $files) {
             $fi = Get-Item -LiteralPath $filePath
             $existing = @($release.assets | Where-Object { $_.name -ceq $fi.Name })
@@ -146,7 +155,7 @@ if ($Provider -eq 'github') {
             try {
                 $content = [Net.Http.StreamContent]::new($stream)
                 $content.Headers.ContentType = [Net.Http.Headers.MediaTypeHeaderValue]::new('application/octet-stream')
-                $uri = "$uploadBase?name=$([Uri]::EscapeDataString($fi.Name))"
+                $uri = "${uploadBase}?name=$([Uri]::EscapeDataString($fi.Name))"
                 $resp = $client.PostAsync($uri, $content).GetAwaiter().GetResult()
                 if (-not $resp.IsSuccessStatusCode) {
                     $st = [int]$resp.StatusCode
@@ -189,6 +198,45 @@ if (-not $token) {
 }
 if (-not $token) {
     throw "CNB credential unavailable. Set `$env:CNB_TOKEN or provide DPAPI token file at $CnbTokenFile."
+}
+
+# Optionally push Git source (main + tag) from a bundle using the DPAPI credential helper
+if ($BundlePath) {
+    if (-not (Test-Path -LiteralPath $BundlePath -PathType Leaf)) {
+        throw "Git bundle not found: $BundlePath"
+    }
+    $bare = Join-Path ([IO.Path]::GetTempPath()) ('rhpicture-cnb-git-' + [guid]::NewGuid().ToString('N') + '.git')
+    try {
+        $null = & git init --bare $bare 2>$null
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to init bare git repo' }
+        $null = & git -C $bare fetch $BundlePath 'refs/heads/main:refs/heads/main' ("refs/tags/${tag}:refs/tags/${tag}") 2>$null
+        if ($LASTEXITCODE -ne 0) { throw 'Failed to fetch from git bundle' }
+        $helper = (Join-Path $PSScriptRoot 'cnb-git-credential.ps1').Replace('\', '/')
+        $pwsh = (Get-Process -Id $PID).Path.Replace('\', '/')
+        $credCmd = '!"' + $pwsh + '" -NoProfile -NonInteractive -File "' + $helper + '"'
+        $psi = [Diagnostics.ProcessStartInfo]::new('git')
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        foreach ($arg in @('-C', $bare, '-c', 'credential.helper=', '-c', ("credential.helper=$credCmd"), 'push', "https://cnb.cool/$Repository.git", 'refs/heads/main:refs/heads/main', "refs/tags/${tag}:refs/tags/${tag}")) {
+            $psi.ArgumentList.Add($arg)
+        }
+        $psi.Environment['GIT_TERMINAL_PROMPT'] = '0'
+        $psi.Environment['RHPICTURE_CNB_TOKEN_FILE'] = [IO.Path]::GetFullPath($CnbTokenFile)
+        $gproc = [Diagnostics.Process]::Start($psi)
+        try {
+            $null = $gproc.StandardOutput.ReadToEndAsync()
+            $null = $gproc.StandardError.ReadToEndAsync()
+            if (-not $gproc.WaitForExit(180000)) { $gproc.Kill(); throw 'CNB git push timed out' }
+            if ($gproc.ExitCode -ne 0) { throw "CNB git push failed (exit $($gproc.ExitCode))" }
+        } finally {
+            $gproc.Dispose()
+        }
+        Write-Output "Pushed source main + $tag to https://cnb.cool/$Repository.git"
+    } finally {
+        if (Test-Path -LiteralPath $bare) { Remove-Item -LiteralPath $bare -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 $handler = [Net.Http.HttpClientHandler]::new()
