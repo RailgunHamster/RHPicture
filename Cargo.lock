@@ -952,7 +952,7 @@ dependencies = [
 
 [[package]]
 name = "rhpicture"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "embed-resource",
  "image",

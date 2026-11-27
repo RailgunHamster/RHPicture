@@ -329,6 +329,81 @@ pub fn verify_cached(directory: &Path, asset: &VelopackAsset) -> Result<bool, St
     }
 }
 
+fn asset_digest_key(asset: &VelopackAsset) -> String {
+    if !asset.SHA256.is_empty() {
+        asset.SHA256.to_ascii_lowercase()
+    } else {
+        asset.SHA1.to_ascii_lowercase()
+    }
+}
+
+fn verify_disk_sha256(
+    directory: &Path,
+    asset: &VelopackAsset,
+    expected_sha256: &str,
+) -> Result<bool, String> {
+    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(false);
+    }
+    let path = cached_path(directory, asset)?;
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !meta.file_type().is_file() || meta.len() == 0 || meta.len() > 2 * 1024 * 1024 * 1024 {
+        return Ok(false);
+    }
+    let (_, sha256) = velopack::misc::calculate_sha1_sha256(&path).map_err(|e| e.to_string())?;
+    Ok(sha256.eq_ignore_ascii_case(expected_sha256))
+}
+
+/// Verifies a locally synthesized delta-patched `.nupkg` bundle.
+///
+/// Velopack's `Update.exe patch` verifies every downloaded `-delta.nupkg` by exact Size + SHA256
+/// before patching, then re-zips the patched files into a new `-full.nupkg`. Because the re-zipped
+/// archive wrapper differs slightly from the build machine's `vpk pack` ZIP bytes (compression/order),
+/// its outer archive Size/SHA256 will not match `TargetFullRelease.Size`/`SHA256`.
+/// Instead, we validate that the file is a readable regular ZIP bundle whose `.nuspec` manifest
+/// matches `PackageId` and `Version`, and return its actual on-disk SHA256 for subsequent checks.
+pub fn verify_patched_bundle(
+    directory: &Path,
+    asset: &VelopackAsset,
+) -> Result<Option<String>, String> {
+    let path = cached_path(directory, asset)?;
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !meta.file_type().is_file() {
+        return Err("更新缓存不是普通文件".into());
+    }
+    if meta.len() == 0 || meta.len() > 2 * 1024 * 1024 * 1024 {
+        return Ok(None);
+    }
+    let mut bundle = match velopack::bundle::load_bundle_from_file(&path) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    let manifest = match bundle.read_manifest() {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    if !asset.PackageId.is_empty() && !manifest.id.eq_ignore_ascii_case(&asset.PackageId) {
+        return Ok(None);
+    }
+    let expected_ver = match semver::Version::parse(&asset.Version) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    if manifest.version != expected_ver {
+        return Ok(None);
+    }
+    let (_, sha256) = velopack::misc::calculate_sha1_sha256(&path).map_err(|e| e.to_string())?;
+    Ok(Some(sha256.to_ascii_lowercase()))
+}
+
 fn run_cancellable<T>(
     token: &CancellationToken,
     future: impl std::future::Future<Output = Result<T, Error>>,
@@ -587,11 +662,19 @@ impl UpdateSource for Mirrors {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedPackage {
+    /// Remote feed digest of `TargetFullRelease` (SHA256 or SHA1) to detect feed replacements.
+    target_digest: String,
+    /// Actual SHA256 of the verified `.nupkg` on disk (exact remote full package or delta-synthesized).
+    disk_sha256: String,
+}
+
 struct UpdaterInner {
     manager: Option<UpdateManager>,
     mirrors: Mirrors,
     available: Option<UpdateInfo>,
-    verified_sha: Option<String>,
+    verified: Option<VerifiedPackage>,
     packages_dir: OnceLock<PathBuf>,
 }
 
@@ -622,7 +705,7 @@ impl UpdateService {
                 manager,
                 mirrors,
                 available: None,
-                verified_sha: None,
+                verified: None,
                 packages_dir: OnceLock::new(),
             })),
         };
@@ -683,9 +766,11 @@ impl UpdateService {
             } else {
                 info.DeltasToTarget.iter().map(|d| d.Size).sum()
             };
-            s.snapshot.pending_restart = inner.verified_sha.as_deref()
-                == Some(info.TargetFullRelease.SHA256.as_str())
-                && !info.TargetFullRelease.SHA256.is_empty();
+            let target_key = asset_digest_key(&info.TargetFullRelease);
+            s.snapshot.pending_restart = inner
+                .verified
+                .as_ref()
+                .is_some_and(|v| !target_key.is_empty() && v.target_digest == target_key);
         } else if let Some(p) = &pending {
             s.snapshot.available_version = Some(p.Version.clone());
             s.snapshot.pending_restart = true;
@@ -799,7 +884,8 @@ impl UpdateService {
                 _ => None,
             };
 
-            let mut verified_sha = None;
+            let prev_verified = self.inner.lock().unwrap().verified.clone();
+            let mut verified = None;
             if let Some(ref info) = found {
                 let pkg_dir = self.packages_dir()?;
                 {
@@ -808,15 +894,35 @@ impl UpdateService {
                     s.snapshot.status = "正在核对本地缓存…".into();
                     s.notify_ui();
                 }
-                if verify_cached(&pkg_dir, &info.TargetFullRelease)? {
-                    verified_sha = Some(info.TargetFullRelease.SHA256.clone());
+                let target = &info.TargetFullRelease;
+                let target_key = asset_digest_key(target);
+                if verify_cached(&pkg_dir, target)? {
+                    let disk_sha256 = if target.SHA256.len() == 64 {
+                        target.SHA256.to_ascii_lowercase()
+                    } else {
+                        let path = cached_path(&pkg_dir, target)?;
+                        velopack::misc::calculate_sha1_sha256(&path)
+                            .map_err(|e| e.to_string())?
+                            .1
+                            .to_ascii_lowercase()
+                    };
+                    verified = Some(VerifiedPackage {
+                        target_digest: target_key,
+                        disk_sha256,
+                    });
+                } else if let Some(prev) = prev_verified.filter(|v| {
+                    !target_key.is_empty() && v.target_digest == target_key
+                }) {
+                    if verify_disk_sha256(&pkg_dir, target, &prev.disk_sha256)? {
+                        verified = Some(prev);
+                    }
                 }
             }
 
             {
                 let mut inner = self.inner.lock().unwrap();
                 inner.available = found;
-                inner.verified_sha = verified_sha;
+                inner.verified = verified;
             }
             self.refresh_snapshot();
 
@@ -911,7 +1017,7 @@ impl UpdateService {
     }
 
     fn run_download_sync(&self) -> Result<(), String> {
-        let (manager, update) = {
+        let (manager, update, prev_verified) = {
             let inner = self.inner.lock().unwrap();
             let manager = inner
                 .manager
@@ -921,16 +1027,43 @@ impl UpdateService {
                 .available
                 .clone()
                 .ok_or_else(|| "请先检查更新".to_string())?;
-            (manager, update)
+            (manager, update, inner.verified.clone())
         };
 
         let pkg_dir = self.packages_dir()?;
         let target = &update.TargetFullRelease;
+        let target_key = asset_digest_key(target);
 
-        if verify_cached(&pkg_dir, target)? {
+        let existing_verified = if verify_cached(&pkg_dir, target)? {
+            let disk_sha256 = if target.SHA256.len() == 64 {
+                target.SHA256.to_ascii_lowercase()
+            } else {
+                let path = cached_path(&pkg_dir, target)?;
+                velopack::misc::calculate_sha1_sha256(&path)
+                    .map_err(|e| e.to_string())?
+                    .1
+                    .to_ascii_lowercase()
+            };
+            Some(VerifiedPackage {
+                target_digest: target_key.clone(),
+                disk_sha256,
+            })
+        } else if let Some(prev) = prev_verified.filter(|v| {
+            !target_key.is_empty() && v.target_digest == target_key
+        }) {
+            if verify_disk_sha256(&pkg_dir, target, &prev.disk_sha256)? {
+                Some(prev)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(verified) = existing_verified {
             {
                 let mut inner = self.inner.lock().unwrap();
-                inner.verified_sha = Some(target.SHA256.clone());
+                inner.verified = Some(verified);
             }
             self.refresh_snapshot();
             let mut s = self.shared.lock().unwrap();
@@ -992,13 +1125,38 @@ impl UpdateService {
             return Err("更新操作已取消".into());
         }
 
-        if !verify_cached(&pkg_dir, target)? {
+        let verified = if verify_cached(&pkg_dir, target)? {
+            let disk_sha256 = if target.SHA256.len() == 64 {
+                target.SHA256.to_ascii_lowercase()
+            } else {
+                let path = cached_path(&pkg_dir, target)?;
+                velopack::misc::calculate_sha1_sha256(&path)
+                    .map_err(|e| e.to_string())?
+                    .1
+                    .to_ascii_lowercase()
+            };
+            VerifiedPackage {
+                target_digest: target_key,
+                disk_sha256,
+            }
+        } else if is_delta {
+            // Velopack verified every delta `.nupkg`'s exact Size + SHA256 before running
+            // `Update.exe patch`, which re-zips the patched files into a valid `.nupkg` whose
+            // outer ZIP archive bytes differ slightly from the build server's full `.nupkg`.
+            let Some(disk_sha256) = verify_patched_bundle(&pkg_dir, target)? else {
+                return Err("增量合成后的更新包校验失败，请重试下载".into());
+            };
+            VerifiedPackage {
+                target_digest: target_key,
+                disk_sha256,
+            }
+        } else {
             return Err("更新包校验失败，请重试下载".into());
-        }
+        };
 
         {
             let mut inner = self.inner.lock().unwrap();
-            inner.verified_sha = Some(target.SHA256.clone());
+            inner.verified = Some(verified);
         }
         self.refresh_snapshot();
         {
@@ -1014,24 +1172,42 @@ impl UpdateService {
     }
 
     fn run_apply_sync(&self, on_exit: &Arc<dyn Fn() + Send + Sync>) -> Result<(), String> {
-        let (manager, pending) = {
+        let (manager, pending, has_available, verified) = {
             let inner = self.inner.lock().unwrap();
             let manager = inner
                 .manager
                 .clone()
                 .ok_or_else(|| "当前未启用 Velopack 托管更新".to_string())?;
+            let has_available = inner.available.is_some();
             let pending = inner
                 .available
                 .as_ref()
                 .map(|u| u.TargetFullRelease.clone())
                 .or_else(|| manager.get_update_pending_restart())
                 .ok_or_else(|| "更新包尚未准备好，请重新下载".to_string())?;
-            (manager, pending)
+            (manager, pending, has_available, inner.verified.clone())
         };
 
         let pkg_dir = self.packages_dir()?;
-        if !verify_cached(&pkg_dir, &pending)? {
-            self.inner.lock().unwrap().verified_sha = None;
+        let valid_on_disk = if has_available {
+            if verify_cached(&pkg_dir, &pending)? {
+                true
+            } else {
+                let target_key = asset_digest_key(&pending);
+                match verified {
+                    Some(ref v) if !target_key.is_empty() && v.target_digest == target_key => {
+                        verify_disk_sha256(&pkg_dir, &pending, &v.disk_sha256)?
+                            && verify_patched_bundle(&pkg_dir, &pending)?.is_some()
+                    }
+                    _ => false,
+                }
+            }
+        } else {
+            // Pending restart discovered from local packages dir (Velopack leaves SHA1/SHA256 empty).
+            verify_patched_bundle(&pkg_dir, &pending)?.is_some()
+        };
+        if !valid_on_disk {
+            self.inner.lock().unwrap().verified = None;
             self.refresh_snapshot();
             return Err("本地缓存校验不匹配，请重新下载".into());
         }
@@ -1224,6 +1400,140 @@ mod tests {
 
         asset.FileName = "../bad.nupkg".into();
         assert!(verify_cached(&dir, &asset).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn build_stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for &b in data {
+                crc ^= b as u32;
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for &(name, data) in entries {
+            let offset = out.len() as u32;
+            let crc = crc32(data);
+            let name_bytes = name.as_bytes();
+            let size = data.len() as u32;
+
+            // Local file header
+            out.extend_from_slice(&0x0403_4B50u32.to_le_bytes());
+            out.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            out.extend_from_slice(&0u16.to_le_bytes()); // flags
+            out.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+            out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+            out.extend_from_slice(&0u16.to_le_bytes()); // mod date
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(data);
+
+            // Central directory header
+            central.extend_from_slice(&0x0201_4B50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes()); // version made by
+            central.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            central.extend_from_slice(&0u16.to_le_bytes()); // flags
+            central.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+            central.extend_from_slice(&0u16.to_le_bytes()); // mod time
+            central.extend_from_slice(&0u16.to_le_bytes()); // mod date
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&size.to_le_bytes());
+            central.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            central.extend_from_slice(&0u16.to_le_bytes()); // extra len
+            central.extend_from_slice(&0u16.to_le_bytes()); // comment len
+            central.extend_from_slice(&0u16.to_le_bytes()); // disk start
+            central.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+            central.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name_bytes);
+        }
+
+        let cd_offset = out.len() as u32;
+        let cd_size = central.len() as u32;
+        out.extend_from_slice(&central);
+
+        // End of central directory
+        out.extend_from_slice(&0x0605_4B50u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // disk num
+        out.extend_from_slice(&0u16.to_le_bytes()); // cd disk
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        out
+    }
+
+    #[test]
+    fn verify_patched_bundle_accepts_rezipped_delta_output_and_rejects_mismatch() {
+        let dir = std::env::temp_dir().join(format!("rhpicture-patched-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let fname = "RHPicture-0.1.5-full.nupkg";
+        let path = dir.join(fname);
+
+        let nuspec = r#"<?xml version="1.0" encoding="utf-8"?>
+<package><metadata>
+  <id>RHPicture</id>
+  <version>0.1.5</version>
+  <title>RHPicture</title>
+  <authors>RailgunHamster</authors>
+  <mainExe>RHPicture.exe</mainExe>
+</metadata></package>"#;
+        let zip_bytes = build_stored_zip(&[
+            ("RHPicture.nuspec", nuspec.as_bytes()),
+            ("lib/app/RHPicture.exe", b"patched-binary"),
+        ]);
+        fs::write(&path, &zip_bytes).unwrap();
+
+        // Simulate TargetFullRelease from releases.win.json having a different outer ZIP size & SHA256
+        // (matching real `vpk pack` vs `Update.exe patch` re-zipped archive behavior).
+        let asset = VelopackAsset {
+            PackageId: "RHPicture".into(),
+            Version: "0.1.5".into(),
+            Type: "Full".into(),
+            FileName: fname.into(),
+            Size: zip_bytes.len() as u64 + 32,
+            SHA256: "a".repeat(64),
+            ..Default::default()
+        };
+
+        // Exact outer archive check fails (the exact cause of first-attempt delta failure),
+        // while patched bundle validation succeeds and returns the actual on-disk SHA256.
+        assert!(!verify_cached(&dir, &asset).unwrap());
+        let disk_sha = verify_patched_bundle(&dir, &asset)
+            .unwrap()
+            .expect("valid delta-synthesized bundle should pass");
+        assert!(verify_disk_sha256(&dir, &asset, &disk_sha).unwrap());
+
+        // Version mismatch or PackageId mismatch must be rejected
+        let mut wrong_ver = asset.clone();
+        wrong_ver.Version = "0.1.6".into();
+        assert!(verify_patched_bundle(&dir, &wrong_ver).unwrap().is_none());
+
+        let mut wrong_id = asset.clone();
+        wrong_id.PackageId = "OtherApp".into();
+        assert!(verify_patched_bundle(&dir, &wrong_id).unwrap().is_none());
+
+        // Post-synthesis file tampering is caught by disk_sha256 check
+        fs::write(&path, b"corrupted-not-a-zip").unwrap();
+        assert!(!verify_disk_sha256(&dir, &asset, &disk_sha).unwrap());
+        assert!(verify_patched_bundle(&dir, &asset).unwrap().is_none());
 
         let _ = fs::remove_dir_all(&dir);
     }

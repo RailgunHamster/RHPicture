@@ -1,6 +1,6 @@
 [package]
 name = "rhpicture"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Ultra-lightweight, zero-VRAM Rust screenshot and screen-pinning tool for Windows"
 license = "MIT"
