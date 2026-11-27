@@ -1,8 +1,8 @@
 use crate::capture::{MonitorInfo, RectI, ScreenCapture, capture_virtual_screen};
 use crate::image_ops::BgraImage;
 use crate::util::{
-    DibSurface, OwnedFont, create_ui_font, current_hinstance, rgb_colorref, scale_dpi, to_wide,
-    trim_working_set,
+    DibSurface, OwnedFont, create_ui_font, current_hinstance, disable_ime, resolve_vk,
+    rgb_colorref, scale_dpi, to_wide, trim_working_set,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -411,6 +411,8 @@ pub fn start_screenshot_overlay(
         });
         return Err("创建截图遮罩窗口失败".into());
     };
+
+    disable_ime(hwnd);
 
     ACTIVE_OVERLAY.with(|cell| {
         if let Some(s) = cell.borrow_mut().as_mut() {
@@ -2675,8 +2677,9 @@ unsafe extern "system" fn overlay_wnd_proc(
             }
             return LRESULT(0);
         }
+        0x010D /* WM_IME_STARTCOMPOSITION */ => return LRESULT(0),
         WM_KEYDOWN => {
-            let vk = wparam.0 as u16;
+            let vk = resolve_vk(wparam, lparam);
             let ctrl = key_down(VK_CONTROL.0);
             let shift = key_down(VK_SHIFT.0);
             let alt = key_down(VK_MENU.0);

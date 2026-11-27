@@ -369,6 +369,43 @@ pub fn system_prefers_dark_mode() -> bool {
     false
 }
 
+/// Disassociate any IME context from shortcut-only windows (pins / capture overlay)
+/// so Chinese/Japanese IME never intercepts single-key shortcuts like H, R, C, T, Esc.
+#[cfg(windows)]
+pub fn disable_ime(hwnd: HWND) {
+    #[link(name = "imm32")]
+    unsafe extern "system" {
+        fn ImmAssociateContext(hwnd: HWND, himc: isize) -> isize;
+    }
+    if !hwnd.is_invalid() {
+        unsafe {
+            let _ = ImmAssociateContext(hwnd, 0);
+        }
+    }
+}
+
+/// Resolve the true virtual key code on `WM_KEYDOWN`, falling back to scan-code decoding
+/// when an active IME turns the key into `VK_PROCESSKEY` (0xE5).
+#[cfg(windows)]
+pub fn resolve_vk(
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> u16 {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VSC_TO_VK, MapVirtualKeyW};
+    const VK_PROCESSKEY_CODE: u16 = 0xE5;
+    let vk = (wparam.0 & 0xFFFF) as u16;
+    if vk == VK_PROCESSKEY_CODE {
+        let sc = ((lparam.0 >> 16) & 0xFF) as u32;
+        if sc != 0 {
+            let mapped = unsafe { MapVirtualKeyW(sc, MAPVK_VSC_TO_VK) } as u16;
+            if mapped != 0 {
+                return mapped;
+            }
+        }
+    }
+    vk
+}
+
 #[cfg(windows)]
 pub fn save_file_dialog(
     owner: Option<HWND>,

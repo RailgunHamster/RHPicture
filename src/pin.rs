@@ -2,8 +2,9 @@ use crate::config::{AppConfig, PinDoubleClickAction};
 use crate::image_ops::{BgraImage, clipboard};
 use crate::popup_menu::{MenuEntry, MenuIcon, show_popup_menu};
 use crate::util::{
-    DibSurface, OwnedFont, create_ui_font, current_hinstance, rgb_colorref, save_file_dialog,
-    scale_dpi, timestamp_filename, to_wide, trim_working_set, window_dpi,
+    DibSurface, OwnedFont, create_ui_font, current_hinstance, disable_ime, resolve_vk,
+    rgb_colorref, save_file_dialog, scale_dpi, timestamp_filename, to_wide, trim_working_set,
+    window_dpi,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -17,19 +18,20 @@ use windows::Win32::Graphics::Gdi::{
     SetTextColor, StretchDIBits, TRANSPARENT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE,
-    VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_MENU, VK_OEM_MINUS, VK_OEM_PLUS, VK_RIGHT,
-    VK_SHIFT, VK_UP,
+    GetAsyncKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
+    TrackMouseEvent, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LEFT, VK_MENU, VK_OEM_MINUS, VK_OEM_PLUS,
+    VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowLongW,
-    GetWindowRect, GWL_EXSTYLE, HWND_TOPMOST, IDC_SIZEALL, KillTimer, LWA_ALPHA, LoadCursorW,
-    RegisterClassExW, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer, SetWindowLongW,
-    SetWindowPos, ShowWindow, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT,
-    WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    GetWindowRect, GWL_EXSTYLE, HTCAPTION, HWND_TOPMOST, IDC_SIZEALL, KillTimer, LWA_ALPHA,
+    LoadCursorW, RegisterClassExW, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
+    SetLayeredWindowAttributes, SetTimer, SetWindowLongW, SetWindowPos, ShowWindow, WINDOWPOS,
+    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_PAINT, WM_RBUTTONUP, WM_TIMER,
+    WM_WINDOWPOSCHANGED, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::PCWSTR;
@@ -104,10 +106,27 @@ impl PinStorage {
     }
 }
 
+#[derive(PartialEq, Eq)]
+struct PinRenderKey {
+    win_w: i32,
+    win_h: i32,
+    hovered: bool,
+    show_border: bool,
+    dark_theme: bool,
+    hud_text: Option<String>,
+    image_gen: u64,
+}
+
+struct CachedPinSurface {
+    key: PinRenderKey,
+    surface: DibSurface,
+}
+
 struct PinWindow {
     id: u64,
     hwnd: HWND,
     storage: PinStorage,
+    image_gen: u64,
     x: i32,
     y: i32,
     scale: f64,
@@ -118,10 +137,10 @@ struct PinWindow {
     tracking_leave: bool,
     dragging: bool,
     drag_start_cursor: (i32, i32),
-    drag_start_win: (i32, i32),
     hud_text: Option<String>,
     hud_dpi: u32,
     font_hud: OwnedFont,
+    cached_surface: Option<CachedPinSurface>,
 }
 
 struct PinManager {
@@ -189,9 +208,10 @@ pub fn create_pin(image: BgraImage, screen_x: i32, screen_y: i32) -> Result<u64,
 
     let class_w = to_wide(PIN_CLASS);
     let title_w = to_wide(&format!("RHPicture 贴图 #{id}"));
+    // Do NOT attach WS_EX_LAYERED by default at 100% opacity so DWM composites natively at full speed!
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             PCWSTR(class_w.as_ptr()),
             PCWSTR(title_w.as_ptr()),
             WS_POPUP | WS_VISIBLE,
@@ -207,15 +227,14 @@ pub fn create_pin(image: BgraImage, screen_x: i32, screen_y: i32) -> Result<u64,
     }
     .map_err(|e| format!("创建贴图窗口失败：{e}"))?;
 
-    unsafe {
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
-    }
+    disable_ime(hwnd);
 
     let initial_dpi = window_dpi(hwnd);
     let pin = PinWindow {
         id,
         hwnd,
         storage: PinStorage::Raw(image),
+        image_gen: 1,
         x: screen_x,
         y: screen_y,
         scale: 1.0,
@@ -226,10 +245,10 @@ pub fn create_pin(image: BgraImage, screen_x: i32, screen_y: i32) -> Result<u64,
         tracking_leave: false,
         dragging: false,
         drag_start_cursor: (0, 0),
-        drag_start_win: (screen_x, screen_y),
         hud_text: None,
         hud_dpi: initial_dpi,
         font_hud: OwnedFont(create_ui_font(initial_dpi, 10, true)),
+        cached_surface: None,
     };
 
     MANAGER.with(|m| {
@@ -244,9 +263,11 @@ pub fn create_pin(image: BgraImage, screen_x: i32, screen_y: i32) -> Result<u64,
             screen_y,
             w,
             h,
-            SWP_NOACTIVATE,
+            Default::default(),
         );
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(Some(hwnd));
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
     Ok(id)
@@ -344,8 +365,10 @@ pub fn show_pin_by_id(id: u64) {
     });
     if let Some(hwnd) = hwnd {
         unsafe {
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = SetFocus(Some(hwnd));
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
     }
@@ -378,16 +401,48 @@ pub fn close_all_pins() {
     trim_working_set();
 }
 
-fn apply_click_through_style(hwnd: HWND, enabled: bool) {
+fn sync_window_exstyle(hwnd: HWND, opacity: u8, click_through: bool) {
+    let need_layered = opacity < 255 || click_through;
     unsafe {
         let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-        let new_ex = if enabled {
-            ex | WS_EX_TRANSPARENT.0
+        let mut new_ex = ex;
+        if need_layered {
+            new_ex |= WS_EX_LAYERED.0;
         } else {
-            ex & !WS_EX_TRANSPARENT.0
-        };
-        SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex as i32);
+            new_ex &= !WS_EX_LAYERED.0;
+        }
+        if click_through {
+            new_ex |= WS_EX_TRANSPARENT.0;
+        } else {
+            new_ex &= !WS_EX_TRANSPARENT.0;
+        }
+        if new_ex != ex {
+            SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex as i32);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+        if need_layered {
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), opacity, LWA_ALPHA);
+        }
     }
+}
+
+fn apply_click_through_style(hwnd: HWND, enabled: bool) {
+    let opacity = MANAGER.with(|m| {
+        m.borrow()
+            .pins
+            .get(&(hwnd.0 as isize))
+            .map(|p| p.opacity)
+            .unwrap_or(255)
+    });
+    sync_window_exstyle(hwnd, opacity, enabled);
 }
 
 impl PinWindow {
@@ -452,6 +507,7 @@ impl PinWindow {
         if let Some(img) = self.storage.ensure_raw() {
             let rotated = img.rotate_90_cw();
             self.storage = PinStorage::Raw(rotated);
+            self.image_gen = self.image_gen.wrapping_add(1);
             let (new_w, new_h) = self.display_size();
             self.set_hud("已旋转 90°");
             return Some((self.x, self.y, new_w, new_h));
@@ -463,6 +519,7 @@ impl PinWindow {
         self.hidden = true;
         self.dragging = false;
         self.hovered = false;
+        self.cached_surface = None;
         self.storage.compress_for_hidden();
     }
 
@@ -477,65 +534,103 @@ impl PinWindow {
         let win_w = (rect.right - rect.left).max(1);
         let win_h = (rect.bottom - rect.top).max(1);
 
-        if let Some(mut surface) = DibSurface::new(win_w, win_h) {
-            if let Some(img) = self.storage.ensure_raw() {
-                let bmi = BITMAPINFO {
-                    bmiHeader: BITMAPINFOHEADER {
-                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                        biWidth: img.width as i32,
-                        biHeight: -(img.height as i32), // top-down BGRA
-                        biPlanes: 1,
-                        biBitCount: 32,
-                        biCompression: BI_RGB.0,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                };
-                unsafe {
-                    let _ = SetStretchBltMode(surface.dc, HALFTONE);
-                    let _ = SetBrushOrgEx(surface.dc, 0, 0, None);
-                    let _ = StretchDIBits(
-                        surface.dc,
-                        0,
-                        0,
-                        win_w,
-                        win_h,
-                        0,
-                        0,
-                        img.width as i32,
-                        img.height as i32,
-                        Some(img.data.as_ptr() as *const _),
-                        &bmi,
-                        DIB_RGB_COLORS,
-                        SRCCOPY,
-                    );
+        let key = PinRenderKey {
+            win_w,
+            win_h,
+            hovered: self.hovered,
+            show_border,
+            dark_theme,
+            hud_text: self.hud_text.clone(),
+            image_gen: self.image_gen,
+        };
+
+        let cache_hit = self
+            .cached_surface
+            .as_ref()
+            .is_some_and(|c| c.key == key);
+
+        if !cache_hit {
+            // Reuse existing DibSurface when dimensions match to avoid multi-MB allocations
+            let existing = self
+                .cached_surface
+                .take()
+                .map(|c| c.surface)
+                .filter(|s| s.width == win_w && s.height == win_h);
+            if let Some(mut surface) = existing.or_else(|| DibSurface::new(win_w, win_h)) {
+                if let Some(img) = self.storage.ensure_raw() {
+                    if win_w == img.width as i32 && win_h == img.height as i32 {
+                        // Fast 1:1 raw copy (50x faster than StretchDIBits HALFTONE!)
+                        surface.pixels_mut().copy_from_slice(&img.data);
+                    } else {
+                        let bmi = BITMAPINFO {
+                            bmiHeader: BITMAPINFOHEADER {
+                                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                                biWidth: img.width as i32,
+                                biHeight: -(img.height as i32), // top-down BGRA
+                                biPlanes: 1,
+                                biBitCount: 32,
+                                biCompression: BI_RGB.0,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        };
+                        unsafe {
+                            let _ = SetStretchBltMode(surface.dc, HALFTONE);
+                            let _ = SetBrushOrgEx(surface.dc, 0, 0, None);
+                            let _ = StretchDIBits(
+                                surface.dc,
+                                0,
+                                0,
+                                win_w,
+                                win_h,
+                                0,
+                                0,
+                                img.width as i32,
+                                img.height as i32,
+                                Some(img.data.as_ptr() as *const _),
+                                &bmi,
+                                DIB_RGB_COLORS,
+                                SRCCOPY,
+                            );
+                        }
+                    }
                 }
-            }
 
-            let dpi = window_dpi(self.hwnd);
-            if dpi != self.hud_dpi {
-                self.hud_dpi = dpi;
-                self.font_hud = OwnedFont(create_ui_font(dpi, 10, true));
-            }
+                let dpi = window_dpi(self.hwnd);
+                if dpi != self.hud_dpi {
+                    self.hud_dpi = dpi;
+                    self.font_hud = OwnedFont(create_ui_font(dpi, 10, true));
+                }
 
-            // Draw crisp dual-tone DPI-scaled border so pins stand out on both white & dark backdrops
-            if show_border || self.hovered {
-                let bw = scale_dpi(1, dpi).clamp(1, 2) as usize;
-                let border = if self.hovered {
-                    [248u8, 189, 56, 255] // #38BDF8 sky-cyan in BGRA
-                } else {
-                    [105u8, 85, 71, 255] // refined slate edge
-                };
-                draw_border(surface.pixels_mut(), win_w as usize, win_h as usize, bw, border);
-            }
+                if show_border || self.hovered {
+                    let bw = scale_dpi(1, dpi).clamp(1, 2) as usize;
+                    let border = if self.hovered {
+                        [248u8, 189, 56, 255] // #38BDF8 sky-cyan in BGRA
+                    } else {
+                        [105u8, 85, 71, 255] // refined slate edge
+                    };
+                    draw_border(surface.pixels_mut(), win_w as usize, win_h as usize, bw, border);
+                }
 
-            // Optional transient HUD pill (zoom / opacity / copied)
-            if let Some(ref text) = self.hud_text {
-                draw_hud_pill(&mut surface, self.font_hud.0, dpi, text, dark_theme);
-            }
+                if let Some(ref text) = self.hud_text {
+                    draw_hud_pill(&mut surface, self.font_hud.0, dpi, text, dark_theme);
+                }
 
-            unsafe {
-                let _ = BitBlt(hdc, 0, 0, win_w, win_h, Some(surface.dc), 0, 0, SRCCOPY);
+                self.cached_surface = Some(CachedPinSurface { key, surface });
+            }
+        }
+
+        if let Some(ref cached) = self.cached_surface {
+            let x = ps.rcPaint.left.clamp(0, win_w);
+            let y = ps.rcPaint.top.clamp(0, win_h);
+            let r = ps.rcPaint.right.clamp(x, win_w);
+            let b = ps.rcPaint.bottom.clamp(y, win_h);
+            let bw = (r - x).max(0);
+            let bh = (b - y).max(0);
+            if bw > 0 && bh > 0 {
+                unsafe {
+                    let _ = BitBlt(hdc, x, y, bw, bh, Some(cached.surface.dc), x, y, SRCCOPY);
+                }
             }
         }
 
@@ -910,12 +1005,10 @@ fn reset_pin_view(hwnd: HWND) {
         m.borrow_mut()
             .pins
             .get_mut(&(hwnd.0 as isize))
-            .map(|p| p.reset_view())
+            .map(|p| (p.reset_view(), p.click_through))
     });
-    if let Some((x, y, w, h)) = geom {
-        unsafe {
-            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
-        }
+    if let Some(((x, y, w, h), ct)) = geom {
+        sync_window_exstyle(hwnd, 255, ct);
         apply_pin_pos(hwnd, x, y, w, h);
     }
 }
@@ -945,16 +1038,14 @@ fn zoom_pin_by(hwnd: HWND, factor: f64, anchor: Option<(i32, i32)>) {
 }
 
 fn set_pin_opacity(hwnd: HWND, alpha: u8) {
-    let clamped = MANAGER.with(|m| {
+    let updated = MANAGER.with(|m| {
         m.borrow_mut()
             .pins
             .get_mut(&(hwnd.0 as isize))
-            .map(|p| p.set_opacity_value(alpha))
+            .map(|p| (p.set_opacity_value(alpha), p.click_through))
     });
-    if let Some(a) = clamped {
-        unsafe {
-            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), a, LWA_ALPHA);
-        }
+    if let Some((a, ct)) = updated {
+        sync_window_exstyle(hwnd, a, ct);
     }
 }
 
@@ -986,13 +1077,13 @@ unsafe extern "system" fn pin_wnd_proc(
             unsafe {
                 let _ = GetCursorPos(&mut pt);
                 let _ = SetForegroundWindow(hwnd);
+                let _ = SetFocus(Some(hwnd));
                 SetCapture(hwnd);
             }
             MANAGER.with(|m| {
                 if let Some(pin) = m.borrow_mut().pins.get_mut(&(hwnd.0 as isize)) {
                     pin.dragging = true;
                     pin.drag_start_cursor = (pt.x, pt.y);
-                    pin.drag_start_win = (pin.x, pin.y);
                 }
             });
             return LRESULT(0);
@@ -1002,7 +1093,7 @@ unsafe extern "system" fn pin_wnd_proc(
             unsafe {
                 let _ = GetCursorPos(&mut pt);
             }
-            let (need_track, need_repaint, move_to) = MANAGER.with(|m| {
+            let (need_track, need_repaint, start_native_drag) = MANAGER.with(|m| {
                 if let Some(pin) = m.borrow_mut().pins.get_mut(&(hwnd.0 as isize)) {
                     let mut track = false;
                     if !pin.tracking_leave {
@@ -1014,19 +1105,20 @@ unsafe extern "system" fn pin_wnd_proc(
                         pin.hovered = true;
                         repaint = true;
                     }
-                    let mut moved = None;
+                    let mut native_drag = false;
                     if pin.dragging {
-                        let nx = pin.drag_start_win.0 + (pt.x - pin.drag_start_cursor.0);
-                        let ny = pin.drag_start_win.1 + (pt.y - pin.drag_start_cursor.1);
-                        if nx != pin.x || ny != pin.y {
-                            pin.x = nx;
-                            pin.y = ny;
-                            moved = Some((nx, ny));
+                        let dx = (pt.x - pin.drag_start_cursor.0).abs();
+                        let dy = (pt.y - pin.drag_start_cursor.1).abs();
+                        // Hand off to native Windows DWM compositor move as soon as cursor moves >= 2px
+                        // (preserves WM_LBUTTONDBLCLK on click while giving silky 144/240Hz DWM dragging!)
+                        if dx >= 2 || dy >= 2 {
+                            pin.dragging = false;
+                            native_drag = true;
                         }
                     }
-                    (track, repaint, moved)
+                    (track, repaint, native_drag)
                 } else {
-                    (false, false, None)
+                    (false, false, false)
                 }
             });
             if need_track {
@@ -1045,20 +1137,34 @@ unsafe extern "system" fn pin_wnd_proc(
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
             }
-            if let Some((nx, ny)) = move_to {
+            if start_native_drag {
+                let packed = (((pt.y as i16 as u16) as usize) << 16) | ((pt.x as i16 as u16) as usize);
                 unsafe {
-                    let _ = SetWindowPos(
+                    let _ = ReleaseCapture();
+                    let _ = SendMessageW(
                         hwnd,
-                        None,
-                        nx,
-                        ny,
-                        0,
-                        0,
-                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        WM_NCLBUTTONDOWN,
+                        Some(WPARAM(HTCAPTION as usize)),
+                        Some(LPARAM(packed as isize)),
                     );
                 }
             }
             return LRESULT(0);
+        }
+        WM_WINDOWPOSCHANGED => {
+            if lparam.0 != 0 {
+                let wp = unsafe { &*(lparam.0 as *const WINDOWPOS) };
+                if (wp.flags & SWP_NOMOVE).0 == 0 {
+                    MANAGER.with(|m| {
+                        if let Ok(mut mgr) = m.try_borrow_mut() {
+                            if let Some(pin) = mgr.pins.get_mut(&(hwnd.0 as isize)) {
+                                pin.x = wp.x;
+                                pin.y = wp.y;
+                            }
+                        }
+                    });
+                }
+            }
         }
         WM_LBUTTONUP => {
             let was_dragging = MANAGER.with(|m| {
@@ -1133,8 +1239,9 @@ unsafe extern "system" fn pin_wnd_proc(
             }
             return LRESULT(0);
         }
+        0x010D /* WM_IME_STARTCOMPOSITION */ => return LRESULT(0),
         WM_KEYDOWN => {
-            let vk = wparam.0 as u16;
+            let vk = resolve_vk(wparam, lparam);
             let ctrl = key_down(VK_CONTROL.0);
             let shift = key_down(VK_SHIFT.0);
             if vk == VK_ESCAPE.0 {
